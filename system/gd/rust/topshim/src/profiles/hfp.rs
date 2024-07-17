@@ -11,6 +11,41 @@ use topshim_macros::{cb_variant, profile_enabled_or};
 use log::warn;
 
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, PartialOrd, Clone)]
+#[repr(u8)]
+pub enum HfpCodecId {
+    NONE = 0x00,
+    CVSD = 0x01,
+    MSBC = 0x02,
+    LC3 = 0x03,
+}
+
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, PartialOrd, Clone)]
+#[repr(u8)]
+pub enum EscoCodingFormat {
+    ULAW = 0x00,
+    ALAW = 0x01,
+    CVSD = 0x02,
+    TRANSPARENT = 0x03,
+    LINEAR = 0x04,
+    MSBC = 0x05,
+    LC3 = 0x06,
+    G729A = 0x07,
+    VENDOR = 0xff,
+}
+
+impl From<u8> for EscoCodingFormat {
+    fn from(item: u8) -> Self {
+        EscoCodingFormat::from_u8(item).unwrap()
+    }
+}
+
+impl From<EscoCodingFormat> for u8 {
+    fn from(item: EscoCodingFormat) -> Self {
+        item as u8
+    }
+}
+
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, PartialOrd, Clone)]
 #[repr(u32)]
 pub enum BthfConnectionState {
     Disconnected = 0,
@@ -41,24 +76,58 @@ impl From<u32> for BthfAudioState {
     }
 }
 
+// This is used for codec-negotiation related methods that do not
+// concern with the coding format. Do not confuse this with |HfpCodecFormat|.
 bitflags! {
     #[derive(Default)]
-    pub struct HfpCodecCapability: i32 {
-        const UNSUPPORTED = 0b00;
-        const CVSD = 0b01;
-        const MSBC = 0b10;
-        const LC3 = 0b100;
+    pub struct HfpCodecBitId: i32 {
+        const NONE = 0b000;
+        const CVSD = 0b001;
+        const MSBC = 0b010;
+        const LC3 =  0b100;
     }
 }
 
-impl TryInto<i32> for HfpCodecCapability {
+impl TryInto<u8> for HfpCodecBitId {
+    type Error = ();
+    fn try_into(self) -> Result<u8, Self::Error> {
+        Ok(self.bits().try_into().unwrap())
+    }
+}
+
+impl TryInto<i32> for HfpCodecBitId {
     type Error = ();
     fn try_into(self) -> Result<i32, Self::Error> {
         Ok(self.bits())
     }
 }
 
-impl TryFrom<i32> for HfpCodecCapability {
+impl TryFrom<i32> for HfpCodecBitId {
+    type Error = ();
+    fn try_from(val: i32) -> Result<Self, Self::Error> {
+        Self::from_bits(val).ok_or(())
+    }
+}
+
+bitflags! {
+    #[derive(Default)]
+    pub struct HfpCodecFormat: i32 {
+        const NONE =             0b0000;
+        const CVSD =             0b0001;
+        const MSBC_TRANSPARENT = 0b0010;
+        const MSBC =             0b0100;
+        const LC3_TRANSPARENT =  0b1000;
+    }
+}
+
+impl TryInto<i32> for HfpCodecFormat {
+    type Error = ();
+    fn try_into(self) -> Result<i32, Self::Error> {
+        Ok(self.bits())
+    }
+}
+
+impl TryFrom<i32> for HfpCodecFormat {
     type Error = ();
     fn try_from(val: i32) -> Result<Self, Self::Error> {
         Self::from_bits(val).ok_or(())
@@ -90,10 +159,24 @@ pub mod ffi {
         Held,   // Only used by CLCC response
     }
 
+    #[derive(Debug, Copy, Clone)]
+    /*
+    When a SCO is created, it is necessary to have at least one call in the call list.
+    Otherwise, some headsets may not be able to output sound.
+
+    Therefore, we need to separate the call for CRAS from the call for the application so that
+    we can have a correct life cycle for the call list status.
+    */
+    pub enum CallSource {
+        CRAS,
+        HID,
+    }
+
     #[derive(Debug, Clone)]
     pub struct CallInfo {
         index: i32,
         dir_incoming: bool,
+        source: CallSource,
         state: CallState,
         number: String,
     }
@@ -121,17 +204,18 @@ pub mod ffi {
         type HfpIntf;
 
         unsafe fn GetHfpProfile(btif: *const u8) -> UniquePtr<HfpIntf>;
-
+        unsafe fn interop_insert_call_when_sco_start(bt_addr: RawAddress) -> bool;
         fn init(self: Pin<&mut HfpIntf>) -> i32;
         fn connect(self: Pin<&mut HfpIntf>, bt_addr: RawAddress) -> u32;
         fn connect_audio(
             self: Pin<&mut HfpIntf>,
             bt_addr: RawAddress,
             sco_offload: bool,
-            force_cvsd: bool,
+            disabled_codecs: i32,
         ) -> i32;
         fn set_active_device(self: Pin<&mut HfpIntf>, bt_addr: RawAddress) -> i32;
         fn set_volume(self: Pin<&mut HfpIntf>, volume: i8, bt_addr: RawAddress) -> i32;
+        fn set_mic_volume(self: Pin<&mut HfpIntf>, volume: i8, bt_addr: RawAddress) -> u32;
         fn disconnect(self: Pin<&mut HfpIntf>, bt_addr: RawAddress) -> u32;
         fn disconnect_audio(self: Pin<&mut HfpIntf>, bt_addr: RawAddress) -> i32;
         fn device_status_notification(
@@ -157,6 +241,7 @@ pub mod ffi {
             addr: RawAddress,
         ) -> u32;
         fn simple_at_response(self: Pin<&mut HfpIntf>, ok: bool, addr: RawAddress) -> u32;
+        fn debug_dump(self: Pin<&mut HfpIntf>);
         fn cleanup(self: Pin<&mut HfpIntf>);
 
     }
@@ -164,6 +249,8 @@ pub mod ffi {
         fn hfp_connection_state_callback(state: u32, addr: RawAddress);
         fn hfp_audio_state_callback(state: u32, addr: RawAddress);
         fn hfp_volume_update_callback(volume: u8, addr: RawAddress);
+        fn hfp_mic_volume_update_callback(volume: u8, addr: RawAddress);
+        fn hfp_vendor_specific_at_command_callback(at_string: String, addr: RawAddress);
         fn hfp_battery_level_update_callback(battery_level: u8, addr: RawAddress);
         fn hfp_wbs_caps_update_callback(wbs_supported: bool, addr: RawAddress);
         fn hfp_swb_caps_update_callback(swb_supported: bool, addr: RawAddress);
@@ -173,7 +260,22 @@ pub mod ffi {
         fn hfp_hangup_call_callback(addr: RawAddress);
         fn hfp_dial_call_callback(number: String, addr: RawAddress);
         fn hfp_call_hold_callback(chld: CallHoldCommand, addr: RawAddress);
+        fn hfp_debug_dump_callback(
+            active: bool,
+            codec_id: u16,
+            total_num_decoded_frames: i32,
+            pkt_loss_ratio: f64,
+            begin_ts: u64,
+            end_ts: u64,
+            pkt_status_in_hex: String,
+            pkt_status_in_binary: String,
+        );
     }
+}
+
+pub fn interop_insert_call_when_sco_start(bt_addr: RawAddress) -> bool {
+    //Call an unsafe function in c++. This is necessary for bridge C++ interop API with floss(rust).
+    unsafe { return ffi::interop_insert_call_when_sco_start(bt_addr) }
 }
 
 pub type TelephonyDeviceStatus = ffi::TelephonyDeviceStatus;
@@ -190,6 +292,7 @@ impl TelephonyDeviceStatus {
 }
 
 pub type CallState = ffi::CallState;
+pub type CallSource = ffi::CallSource;
 pub type CallInfo = ffi::CallInfo;
 pub type PhoneState = ffi::PhoneState;
 pub type CallHoldCommand = ffi::CallHoldCommand;
@@ -199,6 +302,8 @@ pub enum HfpCallbacks {
     ConnectionState(BthfConnectionState, RawAddress),
     AudioState(BthfAudioState, RawAddress),
     VolumeUpdate(u8, RawAddress),
+    MicVolumeUpdate(u8, RawAddress),
+    VendorSpecificAtCommand(String, RawAddress),
     BatteryLevelUpdate(u8, RawAddress),
     WbsCapsUpdate(bool, RawAddress),
     SwbCapsUpdate(bool, RawAddress),
@@ -208,6 +313,7 @@ pub enum HfpCallbacks {
     HangupCall(RawAddress),
     DialCall(String, RawAddress),
     CallHold(CallHoldCommand, RawAddress),
+    DebugDump(bool, u16, i32, f64, u64, u64, String, String),
 }
 
 pub struct HfpCallbacksDispatcher {
@@ -230,6 +336,16 @@ cb_variant!(
     HfpCb,
     hfp_volume_update_callback -> HfpCallbacks::VolumeUpdate,
     u8, RawAddress);
+
+cb_variant!(
+    HfpCb,
+    hfp_mic_volume_update_callback -> HfpCallbacks::MicVolumeUpdate,
+    u8, RawAddress);
+
+cb_variant!(
+    HfpCb,
+    hfp_vendor_specific_at_command_callback -> HfpCallbacks::VendorSpecificAtCommand,
+    String, RawAddress);
 
 cb_variant!(
     HfpCb,
@@ -275,6 +391,11 @@ cb_variant!(
     HfpCb,
     hfp_call_hold_callback -> HfpCallbacks::CallHold,
     CallHoldCommand, RawAddress);
+
+cb_variant!(
+    HfpCb,
+    hfp_debug_dump_callback -> HfpCallbacks::DebugDump,
+    bool, u16, i32, f64, u64, u64, String, String);
 
 pub struct Hfp {
     internal: cxx::UniquePtr<ffi::HfpIntf>,
@@ -332,8 +453,13 @@ impl Hfp {
     }
 
     #[profile_enabled_or(BtStatus::NotReady.into())]
-    pub fn connect_audio(&mut self, addr: RawAddress, sco_offload: bool, force_cvsd: bool) -> i32 {
-        self.internal.pin_mut().connect_audio(addr, sco_offload, force_cvsd)
+    pub fn connect_audio(
+        &mut self,
+        addr: RawAddress,
+        sco_offload: bool,
+        disabled_codecs: i32,
+    ) -> i32 {
+        self.internal.pin_mut().connect_audio(addr, sco_offload, disabled_codecs)
     }
 
     #[profile_enabled_or(BtStatus::NotReady.into())]
@@ -344,6 +470,11 @@ impl Hfp {
     #[profile_enabled_or(BtStatus::NotReady.into())]
     pub fn set_volume(&mut self, volume: i8, addr: RawAddress) -> i32 {
         self.internal.pin_mut().set_volume(volume, addr)
+    }
+
+    #[profile_enabled_or(BtStatus::NotReady.into())]
+    pub fn set_mic_volume(&mut self, volume: i8, addr: RawAddress) -> BtStatus {
+        BtStatus::from(self.internal.pin_mut().set_mic_volume(volume, addr))
     }
 
     #[profile_enabled_or(BtStatus::NotReady)]
@@ -401,6 +532,11 @@ impl Hfp {
     #[profile_enabled_or(BtStatus::NotReady)]
     pub fn simple_at_response(&mut self, ok: bool, addr: RawAddress) -> BtStatus {
         BtStatus::from(self.internal.pin_mut().simple_at_response(ok, addr))
+    }
+
+    #[profile_enabled_or]
+    pub fn debug_dump(&mut self) {
+        self.internal.pin_mut().debug_dump();
     }
 
     #[profile_enabled_or(false)]

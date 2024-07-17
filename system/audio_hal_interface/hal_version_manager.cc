@@ -24,6 +24,8 @@
 #include <memory>
 
 #include "aidl/audio_aidl_interfaces.h"
+#include "include/check.h"
+#include "os/log.h"
 
 namespace bluetooth {
 namespace audio {
@@ -34,24 +36,75 @@ using ::aidl::android::hardware::bluetooth::audio::
 static const std::string kDefaultAudioProviderFactoryInterface =
     std::string() + IBluetoothAudioProviderFactory::descriptor + "/default";
 
+std::string toString(BluetoothAudioHalTransport transport) {
+  switch (transport) {
+    case BluetoothAudioHalTransport::UNKNOWN:
+      return "UNKNOWN";
+    case BluetoothAudioHalTransport::HIDL:
+      return "HIDL";
+    case BluetoothAudioHalTransport::AIDL:
+      return "AIDL";
+    default:
+      return std::to_string(static_cast<int32_t>(transport));
+  }
+}
+
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_UNAVAILABLE =
+    BluetoothAudioHalVersion();
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_2_0 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::HIDL, 2, 0);
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_2_1 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::HIDL, 2, 1);
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_AIDL_V1 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::AIDL, 1, 0);
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_AIDL_V2 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::AIDL, 2, 0);
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_AIDL_V3 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::AIDL, 3, 0);
+const BluetoothAudioHalVersion BluetoothAudioHalVersion::VERSION_AIDL_V4 =
+    BluetoothAudioHalVersion(BluetoothAudioHalTransport::AIDL, 4, 0);
+
+// Ideally HalVersionManager can be a singleton class
 std::unique_ptr<HalVersionManager> HalVersionManager::instance_ptr =
     std::make_unique<HalVersionManager>();
+
+/**
+ * A singleton implementation to get the AIDL interface version.
+ */
+BluetoothAudioHalVersion GetAidlInterfaceVersion() {
+  static auto aidl_version = []() -> BluetoothAudioHalVersion {
+    int version = 0;
+    auto provider_factory = IBluetoothAudioProviderFactory::fromBinder(
+        ::ndk::SpAIBinder(AServiceManager_waitForService(
+            kDefaultAudioProviderFactoryInterface.c_str())));
+
+    if (provider_factory == nullptr) {
+      LOG_ERROR(
+          "getInterfaceVersion: Can't get aidl version from unknown factory");
+      return BluetoothAudioHalVersion::VERSION_UNAVAILABLE;
+    }
+
+    auto aidl_retval = provider_factory->getInterfaceVersion(&version);
+    if (!aidl_retval.isOk()) {
+      LOG_ERROR("BluetoothAudioHal::getInterfaceVersion failure: %s",
+                aidl_retval.getDescription().c_str());
+      return BluetoothAudioHalVersion::VERSION_UNAVAILABLE;
+    }
+
+    return BluetoothAudioHalVersion(BluetoothAudioHalTransport::AIDL, version,
+                                    0);
+  }();
+
+  return aidl_version;
+}
+
+BluetoothAudioHalTransport HalVersionManager::GetHalTransport() {
+  return instance_ptr->hal_version_.getTransport();
+}
 
 BluetoothAudioHalVersion HalVersionManager::GetHalVersion() {
   std::lock_guard<std::mutex> guard(instance_ptr->mutex_);
   return instance_ptr->hal_version_;
-}
-
-BluetoothAudioHalTransport HalVersionManager::GetHalTransport() {
-  switch (GetHalVersion()) {
-    case BluetoothAudioHalVersion::VERSION_AIDL_V1:
-      return BluetoothAudioHalTransport::AIDL;
-    case BluetoothAudioHalVersion::VERSION_2_0:
-    case BluetoothAudioHalVersion::VERSION_2_1:
-      return BluetoothAudioHalTransport::HIDL;
-    default:
-      return BluetoothAudioHalTransport::UNKNOWN;
-  }
 }
 
 android::sp<IBluetoothAudioProvidersFactory_2_1>
@@ -91,9 +144,11 @@ HalVersionManager::GetProvidersFactory_2_0() {
 }
 
 HalVersionManager::HalVersionManager() {
+  hal_transport_ = BluetoothAudioHalTransport::UNKNOWN;
   if (AServiceManager_checkService(
           kDefaultAudioProviderFactoryInterface.c_str()) != nullptr) {
-    hal_version_ = BluetoothAudioHalVersion::VERSION_AIDL_V1;
+    hal_version_ = GetAidlInterfaceVersion();
+    hal_transport_ = BluetoothAudioHalTransport::AIDL;
     return;
   }
 
@@ -115,6 +170,7 @@ HalVersionManager::HalVersionManager() {
 
   if (instance_count > 0) {
     hal_version_ = BluetoothAudioHalVersion::VERSION_2_1;
+    hal_transport_ = BluetoothAudioHalTransport::HIDL;
     return;
   }
 
@@ -128,6 +184,7 @@ HalVersionManager::HalVersionManager() {
 
   if (instance_count > 0) {
     hal_version_ = BluetoothAudioHalVersion::VERSION_2_0;
+    hal_transport_ = BluetoothAudioHalTransport::HIDL;
     return;
   }
 

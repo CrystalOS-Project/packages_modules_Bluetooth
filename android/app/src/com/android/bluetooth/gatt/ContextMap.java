@@ -30,6 +30,7 @@ import android.util.Log;
 import androidx.annotation.VisibleForTesting;
 
 import com.android.bluetooth.BluetoothMethodProxy;
+import com.android.bluetooth.le_scan.AppScanStats;
 import com.android.internal.annotations.GuardedBy;
 
 import com.google.common.collect.EvictingQueue;
@@ -49,14 +50,13 @@ import java.util.UUID;
  * This class manages application callbacks and keeps track of GATT connections.
  * @hide
  */
-@VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
 public class ContextMap<C, T> {
     private static final String TAG = GattServiceConfig.TAG_PREFIX + "ContextMap";
 
     /**
      * Connection class helps map connection IDs to device addresses.
      */
-    static class Connection {
+    public static class Connection {
         public int connId;
         public String address;
         public int appId;
@@ -73,7 +73,7 @@ public class ContextMap<C, T> {
     /**
      * Application entry mapping UUIDs to appIDs and callbacks.
      */
-    class App {
+    public class App {
         /** The UUID of the application */
         public UUID uuid;
 
@@ -209,12 +209,22 @@ public class ContextMap<C, T> {
     private Set<Connection> mConnections = new HashSet<Connection>();
     private final Object mConnectionsLock = new Object();
 
-    /**
-     * Add an entry to the application context list.
-     */
-    App add(UUID uuid, WorkSource workSource, C callback, T info, GattService service) {
-        int appUid = Binder.getCallingUid();
-        String appName = service.getPackageManager().getNameForUid(appUid);
+    /** Add an entry to the application context list. */
+    protected App add(
+            UUID uuid,
+            WorkSource workSource,
+            C callback,
+            GattService.PendingIntentInfo piInfo,
+            GattService service) {
+        int appUid;
+        String appName = null;
+        if (piInfo != null) {
+            appUid = piInfo.callingUid;
+            appName = piInfo.callingPackage;
+        } else {
+            appUid = Binder.getCallingUid();
+            appName = service.getPackageManager().getNameForUid(appUid);
+        }
         if (appName == null) {
             // Assign an app name if one isn't found
             appName = "Unknown App (UID: " + appUid + ")";
@@ -225,7 +235,7 @@ public class ContextMap<C, T> {
                 appScanStats = new AppScanStats(appName, workSource, this, service);
                 mAppScanStats.put(appUid, appScanStats);
             }
-            App app = new App(uuid, callback, info, appName, appScanStats);
+            App app = new App(uuid, callback, (T) piInfo, appName, appScanStats);
             mApps.add(app);
             appScanStats.isRegistered = true;
             return app;
@@ -281,7 +291,7 @@ public class ContextMap<C, T> {
     /**
      * Remove the context for a given application ID.
      */
-    void remove(int id) {
+    protected void remove(int id) {
         boolean find = false;
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
@@ -301,7 +311,7 @@ public class ContextMap<C, T> {
         }
     }
 
-    List<Integer> getAllAppsIds() {
+    protected List<Integer> getAllAppsIds() {
         List<Integer> appIds = new ArrayList();
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
@@ -359,7 +369,7 @@ public class ContextMap<C, T> {
     /**
      * Get an application context by ID.
      */
-    App getById(int id) {
+    protected App getById(int id) {
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
             while (i.hasNext()) {
@@ -376,7 +386,7 @@ public class ContextMap<C, T> {
     /**
      * Get an application context by UUID.
      */
-    App getByUuid(UUID uuid) {
+    protected App getByUuid(UUID uuid) {
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
             while (i.hasNext()) {
@@ -393,7 +403,7 @@ public class ContextMap<C, T> {
     /**
      * Get an application context by the calling Apps name.
      */
-    App getByName(String name) {
+    public App getByName(String name) {
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
             while (i.hasNext()) {
@@ -410,7 +420,7 @@ public class ContextMap<C, T> {
     /**
      * Get an application context by the context info object.
      */
-    App getByContextInfo(T contextInfo) {
+    protected App getByContextInfo(T contextInfo) {
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
             while (i.hasNext()) {
@@ -427,7 +437,7 @@ public class ContextMap<C, T> {
     /**
      * Get Logging info by ID
      */
-    AppScanStats getAppScanStatsById(int id) {
+    protected AppScanStats getAppScanStatsById(int id) {
         App temp = getById(id);
         if (temp != null) {
             return temp.appScanStats;
@@ -438,7 +448,7 @@ public class ContextMap<C, T> {
     /**
      * Get Logging info by application UID
      */
-    AppScanStats getAppScanStatsByUid(int uid) {
+    public AppScanStats getAppScanStatsByUid(int uid) {
         return mAppScanStats.get(uid);
     }
 
@@ -646,7 +656,7 @@ public class ContextMap<C, T> {
         return null;
     }
 
-    List<Connection> getConnectionByApp(int appId) {
+    public List<Connection> getConnectionByApp(int appId) {
         List<Connection> currentConnections = new ArrayList<Connection>();
         synchronized (mConnectionsLock) {
             Iterator<Connection> i = mConnections.iterator();
@@ -663,7 +673,7 @@ public class ContextMap<C, T> {
     /**
      * Erases all application context entries.
      */
-    void clear() {
+    protected void clear() {
         synchronized (mAppsLock) {
             Iterator<App> i = mApps.iterator();
             while (i.hasNext()) {
@@ -702,7 +712,7 @@ public class ContextMap<C, T> {
     /**
      * Logs debug information.
      */
-    void dump(StringBuilder sb) {
+    protected void dump(StringBuilder sb) {
         sb.append("  Entries: " + mAppScanStats.size() + "\n\n");
 
         Iterator<Map.Entry<Integer, AppScanStats>> it = mAppScanStats.entrySet().iterator();

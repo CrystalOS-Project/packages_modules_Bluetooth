@@ -23,26 +23,9 @@
 
 #include <cstdint>
 #include <functional>
-#include <map>
-#include <string>
 
 // Original included files, if any
-// NOTE: Since this is a mock file with mock definitions some number of
-//       include files may not be required.  The include-what-you-use
-//       still applies, but crafting proper inclusion is out of scope
-//       for this effort.  This compilation unit may compile as-is, or
-//       may need attention to prune from (or add to ) the inclusion set.
-#include <string.h>
-
-#include <cstring>
-
-#include "bt_target.h"
 #include "bta/hh/bta_hh_int.h"
-#include "btif/include/btif_storage.h"
-#include "osi/include/osi.h"
-#include "stack/include/acl_api.h"
-#include "stack/include/btm_client_interface.h"
-#include "test/common/mock_functions.h"
 #include "types/raw_address.h"
 
 // Mocked compile conditionals, if any
@@ -105,40 +88,42 @@ struct bta_hh_dev_handle_to_cb_idx {
 extern struct bta_hh_dev_handle_to_cb_idx bta_hh_dev_handle_to_cb_idx;
 
 // Name: bta_hh_find_cb
-// Params: const RawAddress& bda
+// Params: const tAclLinkSpec& link_spec
 // Return: uint8_t
 struct bta_hh_find_cb {
   uint8_t return_value{0};
-  std::function<uint8_t(const RawAddress& bda)> body{
-      [this](const RawAddress& bda) { return return_value; }};
-  uint8_t operator()(const RawAddress& bda) { return body(bda); };
+  std::function<uint8_t(const tAclLinkSpec& link_spec)> body{
+      [this](const tAclLinkSpec& link_spec) { return return_value; }};
+  uint8_t operator()(const tAclLinkSpec& link_spec) { return body(link_spec); };
 };
 extern struct bta_hh_find_cb bta_hh_find_cb;
 
 // Name: bta_hh_get_cb
-// Params: const RawAddress& bda
+// Params: const tAclLinkSpec& link_spec
 // Return: tBTA_HH_DEV_CB*
 struct bta_hh_get_cb {
   tBTA_HH_DEV_CB* return_value{0};
-  std::function<tBTA_HH_DEV_CB*(const RawAddress& bda)> body{
-      [this](const RawAddress& bda) { return return_value; }};
-  tBTA_HH_DEV_CB* operator()(const RawAddress& bda) { return body(bda); };
+  std::function<tBTA_HH_DEV_CB*(const tAclLinkSpec& link_spec)> body{
+      [this](const tAclLinkSpec& link_spec) { return return_value; }};
+  tBTA_HH_DEV_CB* operator()(const tAclLinkSpec& link_spec) {
+    return body(link_spec);
+  };
 };
 extern struct bta_hh_get_cb bta_hh_get_cb;
 
 // Name: bta_hh_read_ssr_param
-// Params: const RawAddress& bd_addr, uint16_t* p_max_ssr_lat, uint16_t*
+// Params: const tAclLinkSpec& bd_addr, uint16_t* p_max_ssr_lat, uint16_t*
 // p_min_ssr_tout Return: tBTA_HH_STATUS
 struct bta_hh_read_ssr_param {
   tBTA_HH_STATUS return_value{0};
-  std::function<tBTA_HH_STATUS(const RawAddress& bd_addr,
+  std::function<tBTA_HH_STATUS(const tAclLinkSpec& link_spec,
                                uint16_t* p_max_ssr_lat,
                                uint16_t* p_min_ssr_tout)>
-      body{[this](const RawAddress& bd_addr, uint16_t* p_max_ssr_lat,
+      body{[this](const tAclLinkSpec& link_spec, uint16_t* p_max_ssr_lat,
                   uint16_t* p_min_ssr_tout) { return return_value; }};
-  tBTA_HH_STATUS operator()(const RawAddress& bd_addr, uint16_t* p_max_ssr_lat,
-                            uint16_t* p_min_ssr_tout) {
-    return body(bd_addr, p_max_ssr_lat, p_min_ssr_tout);
+  tBTA_HH_STATUS operator()(const tAclLinkSpec& link_spec,
+                            uint16_t* p_max_ssr_lat, uint16_t* p_min_ssr_tout) {
+    return body(link_spec, p_max_ssr_lat, p_min_ssr_tout);
   };
 };
 extern struct bta_hh_read_ssr_param bta_hh_read_ssr_param;

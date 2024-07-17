@@ -20,8 +20,10 @@
 #define BTIF_DM_H
 
 #include "bta/include/bta_api.h"
-#include "bte_appl.h"
+#include "bta/include/bta_sec_api.h"
 #include "btif_uid.h"
+#include "internal_include/bt_target.h"
+#include "internal_include/bte_appl.h"
 #include "types/raw_address.h"
 
 /*******************************************************************************
@@ -35,6 +37,7 @@
 #define COD_HID_POINTING 0x0580
 #define COD_HID_COMBO 0x05C0
 #define COD_HID_MAJOR 0x0500
+#define COD_HID_SUB_MAJOR 0x00C0
 #define COD_HID_MASK 0x0700
 #define COD_AV_HEADSETS 0x0404
 #define COD_AV_HANDSFREE 0x0408
@@ -50,9 +53,14 @@ void btif_dm_init(uid_set_t* set);
 void btif_dm_cleanup(void);
 
 /**
- * BTIF callback to switch context from bte to btif
+ * BTIF callback for security events
  */
-void bte_dm_evt(tBTA_DM_SEC_EVT event, tBTA_DM_SEC* p_data);
+void btif_dm_sec_evt(tBTA_DM_SEC_EVT event, tBTA_DM_SEC* p_data);
+
+/**
+ * BTIF callback for ACL up/down and address consolidation events
+ */
+void btif_dm_acl_evt(tBTA_DM_ACL_EVT event, tBTA_DM_ACL* p_data);
 
 /**
  * Notify BT disable being initiated. DM may chose to abort
@@ -73,7 +81,7 @@ void btif_dm_proc_io_rsp(const RawAddress& bd_addr, tBTM_IO_CAP io_cap,
 /**
  * Device Configuration Queries
  */
-void btif_dm_get_local_class_of_device(DEV_CLASS device_class);
+DEV_CLASS btif_dm_get_local_class_of_device();
 
 /**
  * Out-of-band functions
@@ -82,14 +90,12 @@ void btif_dm_set_oob_for_io_req(tBTM_OOB_DATA* p_oob_data);
 void btif_dm_set_oob_for_le_io_req(const RawAddress& bd_addr,
                                    tBTM_OOB_DATA* p_oob_data,
                                    tBTM_LE_AUTH_REQ* p_auth_req);
-#ifdef BTIF_DM_OOB_TEST
 void btif_dm_load_local_oob(void);
 void btif_dm_proc_loc_oob(tBT_TRANSPORT transport, bool is_valid,
                           const Octet16& c, const Octet16& r);
 bool btif_dm_proc_rmt_oob(const RawAddress& bd_addr, Octet16* p_c,
                           Octet16* p_r);
 void btif_dm_generate_local_oob_data(tBT_TRANSPORT transport);
-#endif /* BTIF_DM_OOB_TEST */
 
 void btif_dm_clear_event_filter();
 
@@ -143,5 +149,6 @@ void btif_dm_update_ble_remote_properties(const RawAddress& bd_addr,
                                           tBT_DEVICE_TYPE dev_type);
 
 bool check_cod_hid(const RawAddress& bd_addr);
+bool check_cod_hid_major(const RawAddress& bd_addr, uint32_t cod);
 bool is_device_le_audio_capable(const RawAddress bd_addr);
 #endif

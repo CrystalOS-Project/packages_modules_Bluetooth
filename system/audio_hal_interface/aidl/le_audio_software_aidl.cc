@@ -25,7 +25,7 @@
 
 #include "codec_status_aidl.h"
 #include "hal_version_manager.h"
-#include "osi/include/log.h"
+#include "os/log.h"
 
 namespace bluetooth {
 namespace audio {
@@ -45,7 +45,7 @@ using ::bluetooth::audio::le_audio::LeAudioClientInterface;
 using ::bluetooth::audio::le_audio::StartRequestState;
 using ::bluetooth::audio::le_audio::StreamCallbacks;
 using ::le_audio::set_configurations::SetConfiguration;
-using ::le_audio::types::LeAudioLc3Config;
+using ::le_audio::types::LeAudioCoreCodecConfig;
 
 static ChannelMode le_audio_channel_mode2audio_hal(uint8_t channels_count) {
   switch (channels_count) {
@@ -66,9 +66,16 @@ LeAudioTransport::LeAudioTransport(void (*flush)(void),
       total_bytes_processed_(0),
       data_position_({}),
       pcm_config_(std::move(pcm_config)),
-      start_request_state_(StartRequestState::IDLE){};
+      start_request_state_(StartRequestState::IDLE),
+      dsa_mode_(DsaMode::DISABLED){};
 
 BluetoothAudioCtrlAck LeAudioTransport::StartRequest(bool is_low_latency) {
+  // Check if operation is pending already
+  if (GetStartRequestState() == StartRequestState::PENDING_AFTER_RESUME) {
+    LOG_INFO("Start request is already pending. Ignore the request");
+    return BluetoothAudioCtrlAck::PENDING;
+  }
+
   SetStartRequestState(StartRequestState::PENDING_BEFORE_RESUME);
   if (stream_cb_.on_resume_(true)) {
     auto expected = StartRequestState::CONFIRMED;
@@ -101,6 +108,43 @@ BluetoothAudioCtrlAck LeAudioTransport::StartRequest(bool is_low_latency) {
   return BluetoothAudioCtrlAck::FAILURE;
 }
 
+BluetoothAudioCtrlAck LeAudioTransport::StartRequestV2(bool is_low_latency) {
+  // Check if operation is pending already
+  if (GetStartRequestState() == StartRequestState::PENDING_AFTER_RESUME) {
+    LOG_INFO("Start request is already pending. Ignore the request");
+    return BluetoothAudioCtrlAck::PENDING;
+  }
+
+  SetStartRequestState(StartRequestState::PENDING_BEFORE_RESUME);
+  if (stream_cb_.on_resume_(true)) {
+    std::lock_guard<std::mutex> guard(start_request_state_mutex_);
+
+    switch (start_request_state_) {
+      case StartRequestState::CONFIRMED:
+        LOG_INFO("Start completed.");
+        SetStartRequestState(StartRequestState::IDLE);
+        return BluetoothAudioCtrlAck::SUCCESS_FINISHED;
+      case StartRequestState::CANCELED:
+        LOG_INFO("Start request failed.");
+        SetStartRequestState(StartRequestState::IDLE);
+        return BluetoothAudioCtrlAck::FAILURE;
+      case StartRequestState::PENDING_BEFORE_RESUME:
+        LOG_INFO("Start pending.");
+        SetStartRequestState(StartRequestState::PENDING_AFTER_RESUME);
+        return BluetoothAudioCtrlAck::PENDING;
+      default:
+        SetStartRequestState(StartRequestState::IDLE);
+        LOG_ERROR("Unexpected state %d",
+                  static_cast<int>(start_request_state_.load()));
+        return BluetoothAudioCtrlAck::FAILURE;
+    }
+  }
+
+  SetStartRequestState(StartRequestState::IDLE);
+  LOG_INFO("On resume failed.");
+  return BluetoothAudioCtrlAck::FAILURE;
+}
+
 BluetoothAudioCtrlAck LeAudioTransport::SuspendRequest() {
   LOG(INFO) << __func__;
   if (stream_cb_.on_suspend_()) {
@@ -118,7 +162,28 @@ void LeAudioTransport::StopRequest() {
   }
 }
 
-void LeAudioTransport::SetLowLatency(bool is_low_latency) {}
+void LeAudioTransport::SetLatencyMode(LatencyMode latency_mode) {
+  LOG_DEBUG("Latency mode: %s",
+            ::aidl::android::hardware::bluetooth::audio::toString(latency_mode)
+                .c_str());
+  switch (latency_mode) {
+    case LatencyMode::FREE:
+      dsa_mode_ = DsaMode::DISABLED;
+      break;
+    case LatencyMode::LOW_LATENCY:
+      dsa_mode_ = DsaMode::ACL;
+      break;
+    case LatencyMode::DYNAMIC_SPATIAL_AUDIO_SOFTWARE:
+      dsa_mode_ = DsaMode::ISO_SW;
+      break;
+    case LatencyMode::DYNAMIC_SPATIAL_AUDIO_HARDWARE:
+      dsa_mode_ = DsaMode::ISO_HW;
+      break;
+    default:
+      LOG(WARNING) << ", invalid latency mode: " << (int)latency_mode;
+      break;
+  }
+}
 
 bool LeAudioTransport::GetPresentationPosition(uint64_t* remote_delay_report_ns,
                                                uint64_t* total_bytes_processed,
@@ -138,7 +203,7 @@ bool LeAudioTransport::GetPresentationPosition(uint64_t* remote_delay_report_ns,
 }
 
 void LeAudioTransport::SourceMetadataChanged(
-    const source_metadata_t& source_metadata) {
+    const source_metadata_v7_t& source_metadata) {
   auto track_count = source_metadata.track_count;
 
   if (track_count == 0) {
@@ -146,11 +211,11 @@ void LeAudioTransport::SourceMetadataChanged(
     return;
   }
 
-  stream_cb_.on_metadata_update_(source_metadata);
+  stream_cb_.on_metadata_update_(source_metadata, dsa_mode_);
 }
 
 void LeAudioTransport::SinkMetadataChanged(
-    const sink_metadata_t& sink_metadata) {
+    const sink_metadata_v7_t& sink_metadata) {
   auto track_count = sink_metadata.track_count;
 
   if (track_count == 0) {
@@ -220,6 +285,23 @@ LeAudioTransport::LeAudioGetBroadcastConfig() {
   return broadcast_config_;
 }
 
+bool LeAudioTransport::IsRequestCompletedAfterUpdate(
+    const std::function<std::pair<StartRequestState, bool>(StartRequestState)>&
+        lambda) {
+  std::lock_guard<std::mutex> guard(start_request_state_mutex_);
+  auto result = lambda(start_request_state_);
+  auto new_state = std::get<0>(result);
+  if (new_state != start_request_state_) {
+    start_request_state_ = new_state;
+  }
+
+  auto ret = std::get<1>(result);
+  LOG_VERBOSE(" new state: %d, return %s", (int)(start_request_state_.load()),
+              ret ? "true" : "false");
+
+  return ret;
+}
+
 StartRequestState LeAudioTransport::GetStartRequestState(void) {
   return start_request_state_;
 }
@@ -265,6 +347,9 @@ LeAudioSinkTransport::LeAudioSinkTransport(SessionType session_type,
 LeAudioSinkTransport::~LeAudioSinkTransport() { delete transport_; }
 
 BluetoothAudioCtrlAck LeAudioSinkTransport::StartRequest(bool is_low_latency) {
+  if (IS_FLAG_ENABLED(leaudio_start_stream_race_fix)) {
+    return transport_->StartRequestV2(is_low_latency);
+  }
   return transport_->StartRequest(is_low_latency);
 }
 
@@ -274,8 +359,8 @@ BluetoothAudioCtrlAck LeAudioSinkTransport::SuspendRequest() {
 
 void LeAudioSinkTransport::StopRequest() { transport_->StopRequest(); }
 
-void LeAudioSinkTransport::SetLowLatency(bool is_low_latency) {
-  transport_->SetLowLatency(is_low_latency);
+void LeAudioSinkTransport::SetLatencyMode(LatencyMode latency_mode) {
+  transport_->SetLatencyMode(latency_mode);
 }
 
 bool LeAudioSinkTransport::GetPresentationPosition(
@@ -286,12 +371,12 @@ bool LeAudioSinkTransport::GetPresentationPosition(
 }
 
 void LeAudioSinkTransport::SourceMetadataChanged(
-    const source_metadata_t& source_metadata) {
+    const source_metadata_v7_t& source_metadata) {
   transport_->SourceMetadataChanged(source_metadata);
 }
 
 void LeAudioSinkTransport::SinkMetadataChanged(
-    const sink_metadata_t& sink_metadata) {
+    const sink_metadata_v7_t& sink_metadata) {
   transport_->SinkMetadataChanged(sink_metadata);
 }
 
@@ -328,6 +413,12 @@ LeAudioSinkTransport::LeAudioGetBroadcastConfig() {
   return transport_->LeAudioGetBroadcastConfig();
 }
 
+bool LeAudioSinkTransport::IsRequestCompletedAfterUpdate(
+    const std::function<std::pair<StartRequestState, bool>(StartRequestState)>&
+        lambda) {
+  return transport_->IsRequestCompletedAfterUpdate(lambda);
+}
+
 StartRequestState LeAudioSinkTransport::GetStartRequestState(void) {
   return transport_->GetStartRequestState();
 }
@@ -355,6 +446,9 @@ LeAudioSourceTransport::~LeAudioSourceTransport() { delete transport_; }
 
 BluetoothAudioCtrlAck LeAudioSourceTransport::StartRequest(
     bool is_low_latency) {
+  if (IS_FLAG_ENABLED(leaudio_start_stream_race_fix)) {
+    return transport_->StartRequestV2(is_low_latency);
+  }
   return transport_->StartRequest(is_low_latency);
 }
 
@@ -364,8 +458,8 @@ BluetoothAudioCtrlAck LeAudioSourceTransport::SuspendRequest() {
 
 void LeAudioSourceTransport::StopRequest() { transport_->StopRequest(); }
 
-void LeAudioSourceTransport::SetLowLatency(bool is_low_latency) {
-  transport_->SetLowLatency(is_low_latency);
+void LeAudioSourceTransport::SetLatencyMode(LatencyMode latency_mode) {
+  transport_->SetLatencyMode(latency_mode);
 }
 
 bool LeAudioSourceTransport::GetPresentationPosition(
@@ -376,12 +470,12 @@ bool LeAudioSourceTransport::GetPresentationPosition(
 }
 
 void LeAudioSourceTransport::SourceMetadataChanged(
-    const source_metadata_t& source_metadata) {
+    const source_metadata_v7_t& source_metadata) {
   transport_->SourceMetadataChanged(source_metadata);
 }
 
 void LeAudioSourceTransport::SinkMetadataChanged(
-    const sink_metadata_t& sink_metadata) {
+    const sink_metadata_v7_t& sink_metadata) {
   transport_->SinkMetadataChanged(sink_metadata);
 }
 
@@ -409,6 +503,12 @@ void LeAudioSourceTransport::LeAudioSetSelectedHalPcmConfig(
                                              channels_count, data_interval);
 }
 
+bool LeAudioSourceTransport::IsRequestCompletedAfterUpdate(
+    const std::function<std::pair<StartRequestState, bool>(StartRequestState)>&
+        lambda) {
+  return transport_->IsRequestCompletedAfterUpdate(lambda);
+}
+
 StartRequestState LeAudioSourceTransport::GetStartRequestState(void) {
   return transport_->GetStartRequestState();
 }
@@ -433,15 +533,16 @@ std::unordered_map<int32_t, uint8_t> sampling_freq_map{
     {192000, ::le_audio::codec_spec_conf::kLeAudioSamplingFreq192000Hz}};
 
 std::unordered_map<int32_t, uint8_t> frame_duration_map{
-    {7500, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameDur7500us},
-    {10000, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameDur10000us}};
+    {7500, ::le_audio::codec_spec_conf::kLeAudioCodecFrameDur7500us},
+    {10000, ::le_audio::codec_spec_conf::kLeAudioCodecFrameDur10000us}};
 
 std::unordered_map<int32_t, uint16_t> octets_per_frame_map{
-    {30, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameLen30},
-    {40, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameLen40},
-    {60, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameLen60},
-    {80, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameLen80},
-    {120, ::le_audio::codec_spec_conf::kLeAudioCodecLC3FrameLen120}};
+    {30, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen30},
+    {40, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen40},
+    {60, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen60},
+    {80, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen80},
+    {100, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen100},
+    {120, ::le_audio::codec_spec_conf::kLeAudioCodecFrameLen120}};
 
 std::unordered_map<AudioLocation, uint32_t> audio_location_map{
     {AudioLocation::UNKNOWN,
@@ -458,7 +559,7 @@ std::unordered_map<AudioLocation, uint32_t> audio_location_map{
 
 bool hal_ucast_capability_to_stack_format(
     const UnicastCapability& hal_capability,
-    CodecCapabilitySetting& stack_capability) {
+    CodecConfigSetting& stack_capability) {
   if (hal_capability.codecType != CodecType::LC3) {
     LOG(WARNING) << "Unsupported codecType: "
                  << toString(hal_capability.codecType);
@@ -485,28 +586,37 @@ bool hal_ucast_capability_to_stack_format(
           octets_per_frame_map.end() ||
       audio_location_map.find(supported_channel) == audio_location_map.end()) {
     LOG(ERROR) << __func__ << ": Failed to convert HAL format to stack format"
-               << "\nsample rate = " << sample_rate_hz
-               << "\nframe duration = " << frame_duration_us
+               << "\nsample rate hz = " << sample_rate_hz
+               << "\nframe duration us = " << frame_duration_us
                << "\noctets per frame= " << octets_per_frame
-               << "\naudio location = " << toString(supported_channel);
+               << "\nsupported channel = " << toString(supported_channel)
+               << "\nchannel count per device = " << channel_count
+               << "\ndevice count = " << hal_capability.deviceCount;
 
     return false;
   }
 
-  stack_capability = {
-      .id = ::le_audio::set_configurations::LeAudioCodecIdLc3,
-      .config = LeAudioLc3Config(
-          {.sampling_frequency = sampling_freq_map[sample_rate_hz],
-           .frame_duration = frame_duration_map[frame_duration_us],
-           .audio_channel_allocation = audio_location_map[supported_channel],
-           .octets_per_codec_frame = octets_per_frame_map[octets_per_frame],
-           .channel_count = static_cast<uint8_t>(channel_count)})};
+  stack_capability.id = ::le_audio::set_configurations::LeAudioCodecIdLc3;
+  stack_capability.channel_count_per_iso_stream = channel_count;
+
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeSamplingFreq,
+      sampling_freq_map[sample_rate_hz]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeFrameDuration,
+      frame_duration_map[frame_duration_us]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeAudioChannelAllocation,
+      audio_location_map[supported_channel]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeOctetsPerCodecFrame,
+      octets_per_frame_map[octets_per_frame]);
   return true;
 }
 
 bool hal_bcast_capability_to_stack_format(
     const BroadcastCapability& hal_bcast_capability,
-    CodecCapabilitySetting& stack_capability) {
+    CodecConfigSetting& stack_capability) {
   if (hal_bcast_capability.codecType != CodecType::LC3) {
     LOG(WARNING) << "Unsupported codecType: "
                  << toString(hal_bcast_capability.codecType);
@@ -539,22 +649,30 @@ bool hal_bcast_capability_to_stack_format(
       audio_location_map.find(supported_channel) == audio_location_map.end()) {
     LOG(WARNING) << __func__
                  << " : Failed to convert HAL format to stack format"
-                 << "\nsample rate = " << sample_rate_hz
-                 << "\nframe duration = " << frame_duration_us
+                 << "\nsample rate hz = " << sample_rate_hz
+                 << "\nframe duration us = " << frame_duration_us
                  << "\noctets per frame= " << octets_per_frame
-                 << "\naudio location = " << toString(supported_channel);
+                 << "\nsupported channel = " << toString(supported_channel)
+                 << "\nchannel count per stream = " << channel_count;
 
     return false;
   }
 
-  stack_capability = {
-      .id = ::le_audio::set_configurations::LeAudioCodecIdLc3,
-      .config = LeAudioLc3Config(
-          {.sampling_frequency = sampling_freq_map[sample_rate_hz],
-           .frame_duration = frame_duration_map[frame_duration_us],
-           .audio_channel_allocation = audio_location_map[supported_channel],
-           .octets_per_codec_frame = octets_per_frame_map[octets_per_frame],
-           .channel_count = static_cast<uint8_t>(channel_count)})};
+  stack_capability.id = ::le_audio::set_configurations::LeAudioCodecIdLc3;
+  stack_capability.channel_count_per_iso_stream = channel_count;
+
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeSamplingFreq,
+      sampling_freq_map[sample_rate_hz]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeFrameDuration,
+      frame_duration_map[frame_duration_us]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeAudioChannelAllocation,
+      audio_location_map[supported_channel]);
+  stack_capability.params.Add(
+      ::le_audio::codec_spec_conf::kLeAudioLtvTypeOctetsPerCodecFrame,
+      octets_per_frame_map[octets_per_frame]);
   return true;
 }
 
@@ -567,7 +685,7 @@ std::vector<AudioSetConfiguration> get_offload_capabilities() {
   std::string str_capability_log;
 
   for (auto hal_cap : le_audio_hal_capabilities) {
-    CodecCapabilitySetting encode_cap, decode_cap, bcast_cap;
+    CodecConfigSetting encode_cap, decode_cap, bcast_cap;
     UnicastCapability hal_encode_cap =
         hal_cap.get<AudioCapabilities::leAudioCapabilities>()
             .unicastEncodeCapability;
@@ -641,10 +759,6 @@ AudioConfiguration offload_config_to_hal_audio_config(
   }
 
   return AudioConfiguration(ucast_config);
-}
-
-int GetAidlInterfaceVersion() {
-  return BluetoothAudioSinkClientInterface::GetAidlInterfaceVersion();
 }
 
 }  // namespace le_audio

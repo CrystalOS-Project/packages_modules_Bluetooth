@@ -17,8 +17,11 @@
 package com.android.bluetooth.btservice;
 
 import android.bluetooth.OobData;
+import android.bluetooth.UidTraffic;
 
-final class JniCallbacks {
+import com.android.bluetooth.flags.Flags;
+
+class JniCallbacks {
 
     private RemoteDevices mRemoteDevices;
     private AdapterProperties mAdapterProperties;
@@ -65,6 +68,9 @@ final class JniCallbacks {
 
     void bondStateChangeCallback(int status, byte[] address, int newState, int hciReason) {
         mBondStateMachine.bondStateChangeCallback(status, address, newState, hciReason);
+        if (Flags.removeBondWithAddressMap()) {
+            mRemoteDevices.onBondStateChange(address, newState);
+        }
     }
 
     void addressConsolidateCallback(byte[] mainAddress, byte[] secondaryAddress) {
@@ -79,6 +85,10 @@ final class JniCallbacks {
             int transportLinkType, int hciReason, int handle) {
         mRemoteDevices.aclStateChangeCallback(status, address, newState,
                 transportLinkType, hciReason, handle);
+    }
+
+    void keyMissingCallback(byte[] address) {
+        mRemoteDevices.keyMissingCallback(address);
     }
 
     void stateChangeCallback(int status) {
@@ -118,4 +128,23 @@ final class JniCallbacks {
         mAdapterService.switchCodecCallback(is_low_latency_buffer_size);
     }
 
+    boolean acquireWakeLock(String lockName) {
+        return mAdapterService.acquireWakeLock(lockName);
+    }
+
+    boolean releaseWakeLock(String lockName) {
+        return mAdapterService.releaseWakeLock(lockName);
+    }
+
+    void energyInfoCallback(
+            int status,
+            int ctrlState,
+            long txTime,
+            long rxTime,
+            long idleTime,
+            long energyUsed,
+            UidTraffic[] data) {
+        mAdapterService.energyInfoCallback(
+                status, ctrlState, txTime, rxTime, idleTime, energyUsed, data);
+    }
 }

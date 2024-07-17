@@ -16,13 +16,10 @@
 
 package android.bluetooth.le;
 
-import android.test.suitebuilder.annotation.SmallTest;
-
+import androidx.test.filters.SmallTest;
 import junit.framework.TestCase;
 
-/**
- * Test for Bluetooth LE {@link ScanSettings}.
- */
+/** Test for Bluetooth LE {@link ScanSettings}. */
 public class ScanSettingsTest extends TestCase {
 
     @SmallTest
@@ -64,8 +61,8 @@ public class ScanSettingsTest extends TestCase {
         try {
             builder.setCallbackType(
                     ScanSettings.CALLBACK_TYPE_ALL_MATCHES
-                    | ScanSettings.CALLBACK_TYPE_FIRST_MATCH
-                    | ScanSettings.CALLBACK_TYPE_MATCH_LOST);
+                            | ScanSettings.CALLBACK_TYPE_FIRST_MATCH
+                            | ScanSettings.CALLBACK_TYPE_MATCH_LOST);
             fail("should have thrown IllegalArgumentException!");
         } catch (IllegalArgumentException e) {
             // nothing to do

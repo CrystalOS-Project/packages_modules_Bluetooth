@@ -16,7 +16,13 @@
  */
 
 #include "has_ctp.h"
+
+#include <bluetooth/log.h>
+
 #include "os/log.h"
+#include "stack/include/bt_types.h"
+
+using namespace bluetooth;
 
 namespace le_audio {
 namespace has {
@@ -24,8 +30,7 @@ namespace has {
 static bool ParsePresetGenericUpdate(uint16_t& len, const uint8_t* value,
                                      HasCtpNtf& ntf) {
   if (len < sizeof(ntf.prev_index) + HasPreset::kCharValueMinSize) {
-    LOG(ERROR) << "Invalid preset value length=" << +len
-               << " for generic update.";
+    log::error("Invalid preset value length={} for generic update.", len);
     return false;
   }
 
@@ -39,8 +44,7 @@ static bool ParsePresetGenericUpdate(uint16_t& len, const uint8_t* value,
 static bool ParsePresetIndex(uint16_t& len, const uint8_t* value,
                              HasCtpNtf& ntf) {
   if (len < sizeof(ntf.index)) {
-    LOG(ERROR) << __func__ << "Invalid preset value length=" << +len
-               << " for generic update.";
+    log::error("Invalid preset value length={} for generic update.", len);
     return false;
   }
 
@@ -52,7 +56,7 @@ static bool ParsePresetIndex(uint16_t& len, const uint8_t* value,
 static bool ParsePresetReadResponse(uint16_t& len, const uint8_t* value,
                                     HasCtpNtf& ntf) {
   if (len < sizeof(ntf.is_last) + HasPreset::kCharValueMinSize) {
-    LOG(ERROR) << "Invalid preset value length=" << +len;
+    log::error("Invalid preset value length={}", len);
     return false;
   }
 
@@ -66,7 +70,7 @@ static bool ParsePresetReadResponse(uint16_t& len, const uint8_t* value,
 static bool ParsePresetChanged(uint16_t len, const uint8_t* value,
                                HasCtpNtf& ntf) {
   if (len < sizeof(ntf.is_last) + sizeof(ntf.change_id)) {
-    LOG(ERROR) << __func__ << "Invalid preset value length=" << +len;
+    log::error("Invalid preset value length={}", len);
     return false;
   }
 
@@ -75,7 +79,7 @@ static bool ParsePresetChanged(uint16_t len, const uint8_t* value,
   len -= 1;
   if (change_id > static_cast<std::underlying_type_t<PresetCtpChangeId>>(
                       PresetCtpChangeId::CHANGE_ID_MAX_)) {
-    LOG(ERROR) << __func__ << "Invalid preset chenge_id=" << change_id;
+    log::error("Invalid preset chenge_id={}", change_id);
     return false;
   }
   ntf.change_id = PresetCtpChangeId(change_id);
@@ -101,7 +105,7 @@ static bool ParsePresetChanged(uint16_t len, const uint8_t* value,
 std::optional<HasCtpNtf> HasCtpNtf::FromCharacteristicValue(
     uint16_t len, const uint8_t* value) {
   if (len < 3) {
-    LOG(ERROR) << __func__ << " Invalid Cp notification.";
+    log::error("Invalid Cp notification.");
     return std::nullopt;
   }
 
@@ -113,9 +117,7 @@ std::optional<HasCtpNtf> HasCtpNtf::FromCharacteristicValue(
                  PresetCtpOpcode::READ_PRESET_RESPONSE)) &&
       (op != static_cast<std::underlying_type_t<PresetCtpOpcode>>(
                  PresetCtpOpcode::PRESET_CHANGED))) {
-    LOG(ERROR) << __func__
-               << ": Received invalid opcode in control point notification: "
-               << ++op;
+    log::error("Received invalid opcode in control point notification: {}", op);
     return std::nullopt;
   }
 
@@ -267,9 +269,7 @@ std::ostream& operator<<(std::ostream& out, const HasCtpNtf& ntf) {
         }
         break;
       case PresetCtpChangeId::PRESET_DELETED:
-        FALLTHROUGH;
       case PresetCtpChangeId::PRESET_AVAILABLE:
-        FALLTHROUGH;
       case PresetCtpChangeId::PRESET_UNAVAILABLE:
         out << ", \"index\": " << +ntf.index;
         break;

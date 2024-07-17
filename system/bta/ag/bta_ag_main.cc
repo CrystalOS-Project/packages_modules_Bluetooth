@@ -22,20 +22,25 @@
  *
  ******************************************************************************/
 
+#include <android_bluetooth_flags.h>
+#include <base/logging.h>
+#include <bluetooth/log.h>
+
 #include <string>
 #include <vector>
 
 #include "bta/ag/bta_ag_int.h"
-#include "main/shim/dumpsys.h"
+#include "bta/include/bta_hfp_api.h"
+#include "internal_include/bt_target.h"
+#include "os/log.h"
 #include "osi/include/alarm.h"
 #include "osi/include/compat.h"
-#include "osi/include/log.h"
 #include "osi/include/osi.h"
 #include "stack/include/bt_hdr.h"
 #include "stack/include/btm_api.h"
 #include "types/raw_address.h"
 
-#include <base/logging.h>
+using namespace bluetooth;
 
 /*****************************************************************************
  * Constants and types
@@ -147,6 +152,7 @@ static tBTA_AG_SCB* bta_ag_scb_alloc(void) {
       p_scb->received_at_bac = false;
       p_scb->codec_updated = false;
       p_scb->codec_fallback = false;
+      p_scb->retransmission_effort_retries = 0;
       p_scb->peer_codecs = BTM_SCO_CODEC_CVSD;
       p_scb->sco_codec = BTM_SCO_CODEC_CVSD;
       p_scb->peer_version = HFP_HSP_VERSION_UNKNOWN;
@@ -160,7 +166,10 @@ static tBTA_AG_SCB* bta_ag_scb_alloc(void) {
       /* set eSCO mSBC setting to T2 as the preferred */
       p_scb->codec_msbc_settings = BTA_AG_SCO_MSBC_SETTINGS_T2;
       p_scb->codec_lc3_settings = BTA_AG_SCO_LC3_SETTINGS_T2;
-      APPL_TRACE_DEBUG("bta_ag_scb_alloc %d", bta_ag_scb_to_idx(p_scb));
+      /* set eSCO SWB setting to Q0 as the preferred */
+      p_scb->codec_aptx_settings = BTA_AG_SCO_APTX_SWB_SETTINGS_Q0;
+      p_scb->is_aptx_swb_codec = false;
+      log::verbose("bta_ag_scb_alloc {}", bta_ag_scb_to_idx(p_scb));
       break;
     }
   }
@@ -168,7 +177,7 @@ static tBTA_AG_SCB* bta_ag_scb_alloc(void) {
   if (i == BTA_AG_MAX_NUM_CLIENTS) {
     /* out of scbs */
     p_scb = nullptr;
-    LOG_WARN("Out of scbs");
+    log::warn("Out of scbs");
   }
   return p_scb;
 }
@@ -187,7 +196,7 @@ void bta_ag_scb_dealloc(tBTA_AG_SCB* p_scb) {
   uint8_t idx;
   bool allocated = false;
 
-  APPL_TRACE_DEBUG("bta_ag_scb_dealloc %d", bta_ag_scb_to_idx(p_scb));
+  log::verbose("bta_ag_scb_dealloc {}", bta_ag_scb_to_idx(p_scb));
 
   /* stop and free timers */
   alarm_free(p_scb->ring_timer);
@@ -246,11 +255,11 @@ tBTA_AG_SCB* bta_ag_scb_by_idx(uint16_t idx) {
     p_scb = &bta_ag_cb.scb[idx - 1];
     if (!p_scb->in_use) {
       p_scb = nullptr;
-      APPL_TRACE_WARNING("ag scb idx %d not allocated", idx);
+      log::warn("ag scb idx {} not allocated", idx);
     }
   } else {
     p_scb = nullptr;
-    APPL_TRACE_DEBUG("ag scb idx %d out of range", idx);
+    log::verbose("ag scb idx {} out of range", idx);
   }
   return p_scb;
 }
@@ -294,7 +303,7 @@ uint16_t bta_ag_idx_by_bdaddr(const RawAddress* peer_addr) {
   }
 
   /* no scb found */
-  APPL_TRACE_WARNING("No ag scb for peer addr");
+  log::warn("No ag scb for peer addr");
   return 0;
 }
 
@@ -317,7 +326,7 @@ bool bta_ag_other_scb_open(tBTA_AG_SCB* p_curr_scb) {
     }
   }
   /* no other scb found */
-  LOG_DEBUG("No other ag scb open");
+  log::debug("No other ag scb open");
   return false;
 }
 
@@ -346,8 +355,8 @@ bool bta_ag_scb_open(tBTA_AG_SCB* p_curr_scb) {
  * Returns          void
  *
  ******************************************************************************/
-void bta_ag_collision_cback(UNUSED_ATTR tBTA_SYS_CONN_STATUS status, uint8_t id,
-                            UNUSED_ATTR uint8_t app_id,
+void bta_ag_collision_cback(UNUSED_ATTR tBTA_SYS_CONN_STATUS status,
+                            tBTA_SYS_ID id, UNUSED_ATTR uint8_t app_id,
                             const RawAddress& peer_addr) {
   /* Check if we have opening scb for the peer device. */
   uint16_t handle = bta_ag_idx_by_bdaddr(&peer_addr);
@@ -355,14 +364,14 @@ void bta_ag_collision_cback(UNUSED_ATTR tBTA_SYS_CONN_STATUS status, uint8_t id,
 
   if (p_scb && (p_scb->state == BTA_AG_OPENING_ST)) {
     if (id == BTA_ID_SYS) {
-      LOG(WARNING) << __func__ << ": AG found collision (ACL) for handle "
-                   << unsigned(handle) << " device " << peer_addr;
+      log::warn("AG found collision (ACL) for handle {} device {}",
+                unsigned(handle), ADDRESS_TO_LOGGABLE_STR(peer_addr));
     } else if (id == BTA_ID_AG) {
-      LOG(WARNING) << __func__ << ": AG found collision (RFCOMM) for handle "
-                   << unsigned(handle) << " device " << peer_addr;
+      log::warn("AG found collision (RFCOMM) for handle {} device {}",
+                unsigned(handle), ADDRESS_TO_LOGGABLE_STR(peer_addr));
     } else {
-      LOG(WARNING) << __func__ << ": AG found collision (UNKNOWN) for handle "
-                   << unsigned(handle) << " device " << peer_addr;
+      log::warn("AG found collision (UNKNOWN) for handle {} device {}",
+                unsigned(handle), ADDRESS_TO_LOGGABLE_STR(peer_addr));
     }
     bta_ag_sm_execute(p_scb, BTA_AG_COLLISION_EVT, tBTA_AG_DATA::kEmpty);
   }
@@ -380,13 +389,14 @@ void bta_ag_collision_cback(UNUSED_ATTR tBTA_SYS_CONN_STATUS status, uint8_t id,
  ******************************************************************************/
 void bta_ag_resume_open(tBTA_AG_SCB* p_scb) {
   if (p_scb->state == BTA_AG_INIT_ST) {
-    LOG(INFO) << __func__ << ": Resume connection to " << p_scb->peer_addr
-              << ", handle" << bta_ag_scb_to_idx(p_scb);
+    log::info("Resume connection to {}, handle{}",
+              ADDRESS_TO_LOGGABLE_STR(p_scb->peer_addr),
+              bta_ag_scb_to_idx(p_scb));
     tBTA_AG_DATA open_data = {.api_open = {.bd_addr = p_scb->peer_addr}};
     bta_ag_sm_execute(p_scb, BTA_AG_API_OPEN_EVT, open_data);
   } else {
-    VLOG(1) << __func__ << ": device " << p_scb->peer_addr
-            << " is already in state " << std::to_string(p_scb->state);
+    log::verbose("device {} is already in state {}",
+                 ADDRESS_TO_LOGGABLE_STR(p_scb->peer_addr), p_scb->state);
   }
 }
 
@@ -402,7 +412,7 @@ void bta_ag_resume_open(tBTA_AG_SCB* p_scb) {
  ******************************************************************************/
 void bta_ag_api_enable(tBTA_AG_CBACK* p_cback) {
   /* initialize control block */
-  LOG_INFO("AG api enable");
+  log::info("AG api enable");
   for (tBTA_AG_SCB& scb : bta_ag_cb.scb) {
     alarm_free(scb.ring_timer);
     alarm_free(scb.codec_negotiation_timer);
@@ -439,7 +449,7 @@ void bta_ag_api_disable() {
   int i;
 
   if (!bta_sys_is_register(BTA_ID_AG)) {
-    APPL_TRACE_ERROR("BTA AG is already disabled, ignoring ...");
+    log::error("BTA AG is already disabled, ignoring ...");
     return;
   }
 
@@ -451,6 +461,11 @@ void bta_ag_api_disable() {
       bta_ag_sm_execute(p_scb, BTA_AG_API_DEREGISTER_EVT, tBTA_AG_DATA::kEmpty);
       do_dereg = true;
     }
+  }
+
+  if (IS_FLAG_ENABLED(is_sco_managed_by_audio)) {
+    // Stop session if not done
+    bta_clear_active_device();
   }
 
   if (!do_dereg) {
@@ -475,8 +490,8 @@ void bta_ag_api_register(tBTA_SERVICE_MASK services, tBTA_AG_FEAT features,
                          const std::vector<std::string>& service_names,
                          uint8_t app_id) {
   tBTA_AG_SCB* p_scb = bta_ag_scb_alloc();
-  LOG_DEBUG("bta_ag_api_register: p_scb allocation %s",
-            p_scb == nullptr ? "failed" : "success");
+  log::debug("bta_ag_api_register: p_scb allocation {}",
+             p_scb == nullptr ? "failed" : "success");
   if (p_scb) {
     tBTA_AG_DATA data = {};
     data.api_register.features = features;
@@ -517,14 +532,13 @@ void bta_ag_api_result(uint16_t handle, tBTA_AG_RES result,
   if (handle != BTA_AG_HANDLE_ALL) {
     p_scb = bta_ag_scb_by_idx(handle);
     if (p_scb) {
-      LOG_DEBUG("Audio gateway event for one client handle:%hu scb:%s", handle,
-                p_scb->ToString().c_str());
+      log::debug("Audio gateway event for one client handle:{} scb:{}", handle,
+                 p_scb->ToString());
       bta_ag_sm_execute(p_scb, static_cast<uint16_t>(BTA_AG_API_RESULT_EVT),
                         event_data);
     } else {
-      LOG_WARN(
-          "Received audio gateway event for unknown AG control block "
-          "handle:%hu",
+      log::warn(
+          "Received audio gateway event for unknown AG control block handle:{}",
           handle);
     }
   } else {
@@ -532,8 +546,8 @@ void bta_ag_api_result(uint16_t handle, tBTA_AG_RES result,
     for (i = 0, p_scb = &bta_ag_cb.scb[0]; i < BTA_AG_MAX_NUM_CLIENTS;
          i++, p_scb++) {
       if (p_scb->in_use && p_scb->svc_conn) {
-        LOG_DEBUG("Audio gateway event for all clients scb:%s",
-                  p_scb->ToString().c_str());
+        log::debug("Audio gateway event for all clients scb:{}",
+                   p_scb->ToString());
         bta_ag_sm_execute(p_scb, static_cast<uint16_t>(BTA_AG_API_RESULT_EVT),
                           event_data);
       }
@@ -562,7 +576,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_sco_listen(p_scb, data);
           break;
         case BTA_AG_SCO_OPEN_EVT:
-          LOG_INFO("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
+          log::info("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
           bta_ag_sco_conn_open(p_scb, data);
           break;
         case BTA_AG_SCO_CLOSE_EVT:
@@ -572,7 +586,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_free_db(p_scb, data);
           break;
         default:
-          LOG_ERROR("unknown event %d at state %d", event, p_scb->state);
+          log::error("unknown event {} at state {}", event, p_scb->state);
           break;
       }
       break;
@@ -600,7 +614,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_rfc_fail(p_scb, data);
           break;
         case BTA_AG_SCO_OPEN_EVT:
-          LOG_INFO("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
+          log::info("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
           bta_ag_sco_conn_open(p_scb, data);
           break;
         case BTA_AG_SCO_CLOSE_EVT:
@@ -621,7 +635,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_handle_collision(p_scb, data);
           break;
         default:
-          LOG_ERROR("unknown event %d at state %d", event, p_scb->state);
+          log::error("unknown event {} at state {}", event, p_scb->state);
           break;
       }
       break;
@@ -659,7 +673,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_rfc_data(p_scb, data);
           break;
         case BTA_AG_SCO_OPEN_EVT:
-          LOG_INFO("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
+          log::info("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
           bta_ag_sco_conn_open(p_scb, data);
           bta_ag_post_sco_open(p_scb, data);
           break;
@@ -678,7 +692,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_start_close(p_scb, data);
           break;
         default:
-          LOG_ERROR("unknown event %d at state %d", event, p_scb->state);
+          log::error("unknown event {} at state {}", event, p_scb->state);
           break;
       }
       break;
@@ -695,7 +709,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_rfc_close(p_scb, data);
           break;
         case BTA_AG_SCO_OPEN_EVT:
-          LOG_INFO("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
+          log::info("Opening sco for EVT BTA_AG_SCO_OPEN_EVT");
           bta_ag_sco_conn_open(p_scb, data);
           break;
         case BTA_AG_SCO_CLOSE_EVT:
@@ -710,7 +724,7 @@ static void bta_ag_better_state_machine(tBTA_AG_SCB* p_scb, uint16_t event,
           bta_ag_free_db(p_scb, data);
           break;
         default:
-          LOG_ERROR("unknown event %d at state %d", event, p_scb->state);
+          log::error("unknown event {} at state {}", event, p_scb->state);
           break;
       }
       break;
@@ -732,9 +746,9 @@ void bta_ag_sm_execute(tBTA_AG_SCB* p_scb, uint16_t event,
   uint16_t previous_event = event;
   uint8_t previous_state = p_scb->state;
 
-  LOG_DEBUG(
-      "Execute AG event handle:0x%04x bd_addr:%s state:%s[0x%02x]"
-      " event:%s[0x%04x] result:%s[0x%02x]",
+  log::debug(
+      "Execute AG event handle:0x{:04x} bd_addr:{} state:{}[0x{:02x}] "
+      "event:{}[0x{:04x}] result:{}[0x{:02x}]",
       bta_ag_scb_to_idx(p_scb), ADDRESS_TO_LOGGABLE_CSTR(p_scb->peer_addr),
       bta_ag_state_str(p_scb->state), p_scb->state, bta_ag_evt_str(event),
       event, bta_ag_res_str(data.api_result.result), data.api_result.result);
@@ -742,10 +756,10 @@ void bta_ag_sm_execute(tBTA_AG_SCB* p_scb, uint16_t event,
   bta_ag_better_state_machine(p_scb, event, data);
 
   if (p_scb->state != previous_state) {
-    LOG_DEBUG(
-        "State changed handle:0x%04x bd_addr:%s "
-        "state_change:%s[0x%02x]->%s[0x%02x]"
-        " event:%s[0x%04x] result:%s[0x%02x]",
+    log::debug(
+        "State changed handle:0x{:04x} bd_addr:{} "
+        "state_change:{}[0x{:02x}]->{}[0x{:02x}] event:{}[0x{:04x}] "
+        "result:{}[0x{:02x}]",
         bta_ag_scb_to_idx(p_scb), ADDRESS_TO_LOGGABLE_CSTR(p_scb->peer_addr),
         bta_ag_state_str(previous_state), previous_state,
         bta_ag_state_str(p_scb->state), p_scb->state,
@@ -758,8 +772,8 @@ void bta_ag_sm_execute_by_handle(uint16_t handle, uint16_t event,
                                  const tBTA_AG_DATA& data) {
   tBTA_AG_SCB* p_scb = bta_ag_scb_by_idx(handle);
   if (p_scb) {
-    LOG_DEBUG("AG state machine event:%s[0x%04x] handle:0x%04x",
-              bta_ag_evt_str(event), event, handle);
+    log::debug("AG state machine event:{}[0x{:04x}] handle:0x{:04x}",
+               bta_ag_evt_str(event), event, handle);
     bta_ag_sm_execute(p_scb, event, data);
   }
 }
@@ -771,7 +785,7 @@ void bta_ag_sm_execute_by_handle(uint16_t handle, uint16_t event,
  * @param p_msg event message
  * @return True to free p_msg, or False if p_msg is freed within this function
  */
-bool bta_ag_hdl_event(BT_HDR_RIGID* p_msg) {
+bool bta_ag_hdl_event(const BT_HDR_RIGID* p_msg) {
   switch (p_msg->event) {
     case BTA_AG_RING_TIMEOUT_EVT:
     case BTA_AG_SVC_TIMEOUT_EVT:
@@ -779,8 +793,8 @@ bool bta_ag_hdl_event(BT_HDR_RIGID* p_msg) {
                                   tBTA_AG_DATA::kEmpty);
       break;
     default:
-      LOG(FATAL) << __func__ << ": bad event " << p_msg->event
-                 << " layer_specific=" << p_msg->layer_specific;
+      log::fatal("bad event {} layer_specific={}", p_msg->event,
+                 p_msg->layer_specific);
       break;
   }
   return true;

@@ -22,21 +22,28 @@
  *
  ******************************************************************************/
 
+#define LOG_TAG "sdp_api"
+
 #include "stack/include/sdp_api.h"
 
+#include <bluetooth/log.h>
 #include <string.h>
 
 #include <cstdint>
 
-#include "bt_target.h"
-#include "osi/include/osi.h"  // PTR_TO_UINT
+#include "internal_include/bt_target.h"
+#include "os/log.h"
 #include "stack/include/bt_types.h"
+#include "stack/include/bt_uuid16.h"
 #include "stack/include/sdp_api.h"
+#include "stack/include/sdpdefs.h"
+#include "stack/sdp/internal/sdp_api.h"
 #include "stack/sdp/sdpint.h"
 #include "types/bluetooth/uuid.h"
 #include "types/raw_address.h"
 
 using bluetooth::Uuid;
+using namespace bluetooth;
 
 /**********************************************************************
  *   C L I E N T    F U N C T I O N    P R O T O T Y P E S            *
@@ -72,10 +79,10 @@ bool SDP_InitDiscoveryDb(tSDP_DISCOVERY_DB* p_db, uint32_t len,
   /* verify the parameters */
   if (p_db == NULL || (sizeof(tSDP_DISCOVERY_DB) > len) ||
       num_attr > SDP_MAX_ATTR_FILTERS || num_uuid > SDP_MAX_UUID_FILTERS) {
-    SDP_TRACE_ERROR(
-        "SDP_InitDiscoveryDb Illegal param: p_db 0x%x, len %d, num_uuid %d, "
-        "num_attr %d",
-        PTR_TO_UINT(p_db), len, num_uuid, num_attr);
+    log::error(
+        "SDP_InitDiscoveryDb Illegal param: p_db {}, len {}, num_uuid {}, "
+        "num_attr {}",
+        fmt::ptr(p_db), len, num_uuid, num_attr);
 
     return (false);
   }
@@ -390,14 +397,14 @@ tSDP_DISC_REC* SDP_FindServiceInDb(const tSDP_DISCOVERY_DB* p_db,
              p_sattr = p_sattr->p_next_attr) {
           if ((SDP_DISC_ATTR_TYPE(p_sattr->attr_len_type) == UUID_DESC_TYPE) &&
               (SDP_DISC_ATTR_LEN(p_sattr->attr_len_type) == 2)) {
-            SDP_TRACE_DEBUG(
-                "SDP_FindServiceInDb - p_sattr value = 0x%x serviceuuid = 0x%x",
+            log::verbose(
+                "SDP_FindServiceInDb - p_sattr value = 0x{:x} serviceuuid = "
+                "0x{:x}",
                 p_sattr->attr_value.v.u16, service_uuid);
             if (service_uuid == UUID_SERVCLASS_HDP_PROFILE) {
               if ((p_sattr->attr_value.v.u16 == UUID_SERVCLASS_HDP_SOURCE) ||
                   (p_sattr->attr_value.v.u16 == UUID_SERVCLASS_HDP_SINK)) {
-                SDP_TRACE_DEBUG(
-                    "SDP_FindServiceInDb found HDP source or sink\n");
+                log::verbose("SDP_FindServiceInDb found HDP source or sink\n");
                 return (p_rec);
               }
             }
@@ -594,7 +601,7 @@ static bool sdp_fill_proto_elem(const tSDP_DISC_ATTR* p_attr,
     /* Now, see if the entry contains the layer we are interested in */
     for (p_sattr = p_attr->attr_value.v.p_sub_attr; p_sattr;
          p_sattr = p_sattr->p_next_attr) {
-      /* SDP_TRACE_DEBUG ("SDP - p_sattr 0x%x, layer_uuid:0x%x, u16:0x%x####",
+      /* LOG_VERBOSE ("SDP - p_sattr 0x%x, layer_uuid:0x%x, u16:0x%x####",
           p_sattr, layer_uuid, p_sattr->attr_value.v.u16); */
 
       if ((SDP_DISC_ATTR_TYPE(p_sattr->attr_len_type) == UUID_DESC_TYPE) &&
@@ -784,17 +791,28 @@ uint8_t SDP_GetNumDiRecords(const tSDP_DISCOVERY_DB* p_db) {
  *
  ******************************************************************************/
 static void SDP_AttrStringCopy(char* dst, const tSDP_DISC_ATTR* p_attr,
-                               uint16_t dst_size) {
-  if (dst == NULL) return;
+                               uint16_t dst_size,
+                               uint8_t expected_type) {
+  if (dst == NULL)
+    return;
+
+  dst[0] = '\0';
+
   if (p_attr) {
-    uint16_t len = SDP_DISC_ATTR_LEN(p_attr->attr_len_type);
-    if (len > dst_size - 1) {
-      len = dst_size - 1;
+    uint8_t type = SDP_DISC_ATTR_TYPE(p_attr->attr_len_type);
+
+    if (type == expected_type) {
+      uint16_t len = SDP_DISC_ATTR_LEN(p_attr->attr_len_type);
+      if (len > dst_size - 1) {
+        len = dst_size - 1;
+      }
+      memcpy(dst, (const void*)p_attr->attr_value.v.array, len);
+      dst[len] = '\0';
+    } else {
+      log::error("unexpected attr type={}, expected={}", type, expected_type);
     }
-    memcpy(dst, (const void*)p_attr->attr_value.v.array, len);
-    dst[len] = '\0';
   } else {
-    dst[0] = '\0';
+    log::error("p_attr is NULL");
   }
 }
 
@@ -835,55 +853,68 @@ uint16_t SDP_GetDiRecord(uint8_t get_record_index,
     /* ClientExecutableURL is optional */
     p_curr_attr = SDP_FindAttributeInRec(p_curr_record, ATTR_ID_CLIENT_EXE_URL);
     SDP_AttrStringCopy(p_device_info->rec.client_executable_url, p_curr_attr,
-                       SDP_MAX_ATTR_LEN);
+                       SDP_MAX_ATTR_LEN, URL_DESC_TYPE);
 
     /* Service Description is optional */
+    /* 5.1.16 ServiceDescription attribute */
     p_curr_attr =
         SDP_FindAttributeInRec(p_curr_record, ATTR_ID_SERVICE_DESCRIPTION);
     SDP_AttrStringCopy(p_device_info->rec.service_description, p_curr_attr,
-                       SDP_MAX_ATTR_LEN);
+                       SDP_MAX_ATTR_LEN, TEXT_STR_DESC_TYPE);
 
     /* DocumentationURL is optional */
     p_curr_attr =
         SDP_FindAttributeInRec(p_curr_record, ATTR_ID_DOCUMENTATION_URL);
     SDP_AttrStringCopy(p_device_info->rec.documentation_url, p_curr_attr,
-                       SDP_MAX_ATTR_LEN);
+                       SDP_MAX_ATTR_LEN, URL_DESC_TYPE);
 
     p_curr_attr =
         SDP_FindAttributeInRec(p_curr_record, ATTR_ID_SPECIFICATION_ID);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == UINT_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 2)
       p_device_info->spec_id = p_curr_attr->attr_value.v.u16;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
 
     p_curr_attr = SDP_FindAttributeInRec(p_curr_record, ATTR_ID_VENDOR_ID);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == UINT_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 2)
       p_device_info->rec.vendor = p_curr_attr->attr_value.v.u16;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
 
     p_curr_attr =
         SDP_FindAttributeInRec(p_curr_record, ATTR_ID_VENDOR_ID_SOURCE);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == UINT_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 2)
       p_device_info->rec.vendor_id_source = p_curr_attr->attr_value.v.u16;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
 
     p_curr_attr = SDP_FindAttributeInRec(p_curr_record, ATTR_ID_PRODUCT_ID);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == UINT_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 2)
       p_device_info->rec.product = p_curr_attr->attr_value.v.u16;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
 
     p_curr_attr =
         SDP_FindAttributeInRec(p_curr_record, ATTR_ID_PRODUCT_VERSION);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == UINT_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 2)
       p_device_info->rec.version = p_curr_attr->attr_value.v.u16;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
 
     p_curr_attr = SDP_FindAttributeInRec(p_curr_record, ATTR_ID_PRIMARY_RECORD);
-    if (p_curr_attr)
+    if (p_curr_attr &&
+        SDP_DISC_ATTR_TYPE(p_curr_attr->attr_len_type) == BOOLEAN_DESC_TYPE &&
+        SDP_DISC_ATTR_LEN(p_curr_attr->attr_len_type) >= 1)
       p_device_info->rec.primary_record = (bool)p_curr_attr->attr_value.v.u8;
     else
       result = SDP_ERR_ATTR_NOT_PRESENT;
@@ -1035,22 +1066,6 @@ uint16_t SDP_SetLocalDiRecord(const tSDP_DI_RECORD* p_device_info,
   return result;
 }
 
-/*******************************************************************************
- *
- * Function         SDP_SetTraceLevel
- *
- * Description      This function sets the trace level for SDP. If called with
- *                  a value of 0xFF, it simply reads the current trace level.
- *
- * Returns          the new (current) trace level
- *
- ******************************************************************************/
-uint8_t SDP_SetTraceLevel(uint8_t new_level) {
-  if (new_level != 0xFF) sdp_cb.trace_level = new_level;
-
-  return (sdp_cb.trace_level);
-}
-
 namespace {
 bluetooth::legacy::stack::sdp::tSdpApi api_ = {
     .service =
@@ -1090,7 +1105,6 @@ bluetooth::legacy::stack::sdp::tSdpApi api_ = {
             .SDP_AddProfileDescriptorList = ::SDP_AddProfileDescriptorList,
             .SDP_AddLanguageBaseAttrIDList = ::SDP_AddLanguageBaseAttrIDList,
             .SDP_AddServiceClassIdList = ::SDP_AddServiceClassIdList,
-            .SDP_DeleteAttribute = ::SDP_DeleteAttribute,
         },
     .device_id =
         {

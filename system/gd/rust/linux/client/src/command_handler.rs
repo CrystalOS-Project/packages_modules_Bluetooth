@@ -9,13 +9,16 @@ use crate::bt_gatt::AuthReq;
 use crate::callbacks::{BtGattCallback, BtGattServerCallback};
 use crate::ClientContext;
 use crate::{console_red, console_yellow, print_error, print_info};
-use bt_topshim::btif::{BtConnectionState, BtDiscMode, BtStatus, BtTransport};
+use bt_topshim::btif::{BtConnectionState, BtDiscMode, BtStatus, BtTransport, Uuid, INVALID_RSSI};
 use bt_topshim::profiles::hid_host::BthhReportType;
 use bt_topshim::profiles::sdp::{BtSdpMpsRecord, BtSdpRecord};
 use bt_topshim::profiles::{gatt::LePhy, ProfileConnectionState};
-use btstack::bluetooth::{BluetoothDevice, IBluetooth, IBluetoothQALegacy};
-use btstack::bluetooth_gatt::{GattWriteType, IBluetoothGatt, ScanSettings, ScanType};
-use btstack::bluetooth_media::IBluetoothTelephony;
+use btstack::battery_manager::IBatteryManager;
+use btstack::bluetooth::{BluetoothDevice, IBluetooth};
+use btstack::bluetooth_gatt::{
+    BluetoothGattService, GattDbElementType, GattWriteType, IBluetoothGatt,
+};
+use btstack::bluetooth_media::{IBluetoothMedia, IBluetoothTelephony};
 use btstack::bluetooth_qa::IBluetoothQA;
 use btstack::socket_manager::{IBluetoothSocketManager, SocketResult};
 use btstack::uuid::{Profile, UuidHelper, UuidWrapper};
@@ -27,6 +30,7 @@ const BAR2_CHAR: &str = "-";
 const MAX_MENU_CHAR_WIDTH: usize = 72;
 const GATT_CLIENT_APP_UUID: &str = "12345678123456781234567812345678";
 const GATT_SERVER_APP_UUID: &str = "12345678123456781234567812345679";
+const HEART_RATE_SERVICE_UUID: &str = "0000180D-0000-1000-8000-00805F9B34FB";
 
 enum CommandError {
     // Command not handled due to invalid arguments.
@@ -139,6 +143,24 @@ fn build_commands() -> HashMap<String, CommandOption> {
         },
     );
     command_options.insert(
+        String::from("battery"),
+        CommandOption {
+            rules: vec![
+                String::from("battery status <address>"),
+                String::from("battery track <address>"),
+                String::from("battery untrack <address>"),
+            ],
+            description: String::from(
+                "
+                status: Current battery status of a given device.\n
+                track: Track a given device to monitor battery updates.\n
+                untrack: Stop tracking a device for battery updates.
+            ",
+            ),
+            function_pointer: CommandHandler::cmd_battery,
+        },
+    );
+    command_options.insert(
         String::from("bond"),
         CommandOption {
             rules: vec![String::from("bond <add|remove|cancel> <address>")],
@@ -155,6 +177,7 @@ fn build_commands() -> HashMap<String, CommandOption> {
                 String::from("device set-pairing-pin <address> <pin|reject>"),
                 String::from("device set-pairing-passkey <address> <passkey|reject>"),
                 String::from("device set-alias <address> <new-alias>"),
+                String::from("device get-rssi <address>"),
             ],
             description: String::from("Take action on a remote device. (i.e. info)"),
             function_pointer: CommandHandler::cmd_device,
@@ -201,6 +224,14 @@ fn build_commands() -> HashMap<String, CommandOption> {
                 ),
                 String::from("gatt register-notification <address> <handle> <enable|disable>"),
                 String::from("gatt register-server"),
+                String::from("gatt unregister-server <server_id>"),
+                String::from("gatt server-connect <server_id> <client_address>"),
+                String::from("gatt server-disconnect <server_id> <client_address>"),
+                String::from("gatt server-add-heartrate-service <server_id>"),
+                String::from("gatt server-remove-service <server_id> <service_handle>"),
+                String::from("gatt server-clear-all-services <server_id>"),
+                String::from("gatt server-set-direct-connect <true|false>"),
+                String::from("gatt server-set-connect-transport <Bredr|LE|Auto>"),
             ],
             description: String::from("GATT tools"),
             function_pointer: CommandHandler::cmd_gatt,
@@ -251,7 +282,7 @@ fn build_commands() -> HashMap<String, CommandOption> {
                 String::from(
                     "socket connect <address> <l2cap|rfcomm> <psm|uuid> <auth-required> <Bredr|LE>",
                 ),
-                String::from("socket disconnect <socket_id>"),
+                String::from("socket close <socket_id>"),
                 String::from("socket set-on-connect-schedule <send|resend|dump>"),
             ],
             description: String::from("Socket manager utilities."),
@@ -326,6 +357,14 @@ fn build_commands() -> HashMap<String, CommandOption> {
         },
     );
     command_options.insert(
+        String::from("media"),
+        CommandOption {
+            rules: vec![String::from("media log")],
+            description: String::from("Audio tools."),
+            function_pointer: CommandHandler::cmd_media,
+        },
+    );
+    command_options.insert(
         String::from("quit"),
         CommandOption {
             rules: vec![String::from("quit")],
@@ -358,29 +397,32 @@ impl CommandHandler {
     }
 
     /// Entry point for command and arguments
-    pub fn process_cmd_line(&mut self, command: &str, args: &Vec<String>) {
+    pub fn process_cmd_line(&mut self, command: &str, args: &Vec<String>) -> bool {
         // Ignore empty line
         match command {
-            "" => {}
+            "" => false,
             _ => match self.command_options.get(command) {
                 Some(cmd) => {
                     let rules = cmd.rules.clone();
                     match (cmd.function_pointer)(self, &args) {
-                        Ok(()) => {}
+                        Ok(()) => true,
                         Err(CommandError::InvalidArgs) => {
                             print_error!("Invalid arguments. Usage:\n{}", rules.join("\n"));
+                            false
                         }
                         Err(CommandError::Failed(msg)) => {
                             print_error!("Command failed: {}", msg);
+                            false
                         }
                     }
                 }
                 None => {
                     println!("'{}' is an invalid command!", command);
                     self.cmd_help(&args).ok();
+                    false
                 }
             },
-        };
+        }
     }
 
     fn lock_context(&self) -> std::sync::MutexGuard<ClientContext> {
@@ -481,15 +523,11 @@ impl CommandHandler {
                 };
                 let context = self.lock_context();
                 let adapter_dbus = context.adapter_dbus.as_ref().unwrap();
-                let qa_legacy_dbus = context.qa_legacy_dbus.as_ref().unwrap();
                 let qa_dbus = context.qa_dbus.as_ref().unwrap();
                 let name = adapter_dbus.get_name();
+                let modalias = qa_dbus.get_modalias();
                 let uuids = adapter_dbus.get_uuids();
                 let is_discoverable = adapter_dbus.get_discoverable();
-                let is_connectable = qa_legacy_dbus.get_connectable();
-                let alias = qa_legacy_dbus.get_alias();
-                let modalias = qa_legacy_dbus.get_modalias();
-                let discoverable_mode = qa_dbus.get_discoverable_mode();
                 let discoverable_timeout = adapter_dbus.get_discoverable_timeout();
                 let cod = adapter_dbus.get_bluetooth_class();
                 let multi_adv_supported = adapter_dbus.is_multi_advertisement_supported();
@@ -507,15 +545,15 @@ impl CommandHandler {
                     })
                     .filter(|(_prof, state)| state != &ProfileConnectionState::Disconnected)
                     .collect();
+                qa_dbus.fetch_connectable();
+                qa_dbus.fetch_alias();
+                qa_dbus.fetch_discoverable_mode();
                 print_info!("Address: {}", address);
                 print_info!("Name: {}", name);
-                print_info!("Alias: {}", alias);
                 print_info!("Modalias: {}", modalias);
                 print_info!("State: {}", if enabled { "enabled" } else { "disabled" });
                 print_info!("Discoverable: {}", is_discoverable);
-                print_info!("Discoverable mode: {:?}", discoverable_mode);
                 print_info!("DiscoverableTimeout: {}s", discoverable_timeout);
-                print_info!("Connectable: {}", is_connectable);
                 print_info!("Class: {:#06x}", cod);
                 print_info!("IsMultiAdvertisementSupported: {}", multi_adv_supported);
                 print_info!("IsLeExtendedAdvertisingSupported: {}", le_ext_adv_supported);
@@ -582,14 +620,10 @@ impl CommandHandler {
             },
             "connectable" => match &get_arg(args, 1)?[..] {
                 "on" => {
-                    let ret =
-                        self.lock_context().qa_legacy_dbus.as_mut().unwrap().set_connectable(true);
-                    print_info!("Set connectable on {}", if ret { "succeeded" } else { "failed" });
+                    self.lock_context().qa_dbus.as_mut().unwrap().set_connectable(true);
                 }
                 "off" => {
-                    let ret =
-                        self.lock_context().qa_legacy_dbus.as_mut().unwrap().set_connectable(false);
-                    print_info!("Set connectable off {}", if ret { "succeeded" } else { "failed" });
+                    self.lock_context().qa_dbus.as_mut().unwrap().set_connectable(false);
                 }
                 other => println!("Invalid argument for adapter connectable '{}'", other),
             },
@@ -637,6 +671,79 @@ impl CommandHandler {
         Ok(())
     }
 
+    fn cmd_battery(&mut self, args: &Vec<String>) -> CommandResult {
+        if !self.lock_context().adapter_ready {
+            return Err(self.adapter_not_ready());
+        }
+
+        let command = get_arg(args, 0)?;
+        let address = get_arg(args, 1)?.to_uppercase();
+
+        match &command[..] {
+            "status" => {
+                match self
+                    .lock_context()
+                    .battery_manager_dbus
+                    .as_ref()
+                    .unwrap()
+                    .get_battery_information(address.clone())
+                {
+                    None => println!(
+                        "Battery status for device {} could not be fetched",
+                        address.clone()
+                    ),
+                    Some(set) => {
+                        if set.batteries.len() == 0 {
+                            println!("Battery set for device {} is empty", set.address.clone());
+                            return Ok(());
+                        }
+
+                        println!(
+                            "Battery data for '{}' from source '{}' and uuid '{}':",
+                            set.address.clone(),
+                            set.source_uuid.clone(),
+                            set.source_info.clone()
+                        );
+                        for battery in set.batteries {
+                            println!("   {}%, variant: '{}'", battery.percentage, battery.variant);
+                        }
+                    }
+                }
+            }
+            "track" => {
+                if self.lock_context().battery_address_filter.contains(&address) {
+                    println!("Already tracking {}", address.clone());
+                    return Ok(());
+                }
+                self.lock_context().battery_address_filter.insert(address.clone());
+
+                println!("Currently tracking:");
+                for addr in self.lock_context().battery_address_filter.iter() {
+                    println!("{}", addr);
+                }
+            }
+            "untrack" => {
+                if !self.lock_context().battery_address_filter.remove(&address) {
+                    println!("Not tracking {}", address.clone());
+                    return Ok(());
+                }
+                println!("Stopped tracking {}", address.clone());
+
+                if self.lock_context().battery_address_filter.len() == 0 {
+                    println!("No longer tracking any addresses for battery status updates");
+                    return Ok(());
+                }
+
+                println!("Currently tracking:");
+                for addr in self.lock_context().battery_address_filter.iter() {
+                    println!("{}", addr);
+                }
+            }
+            _ => return Err(CommandError::InvalidArgs),
+        }
+        Ok(())
+    }
+
     fn cmd_bond(&mut self, args: &Vec<String>) -> CommandResult {
         if !self.lock_context().adapter_ready {
             return Err(self.adapter_not_ready());
@@ -678,7 +785,7 @@ impl CommandHandler {
                     name: String::from("Classic Device"),
                 };
 
-                self.lock_context().adapter_dbus.as_ref().unwrap().remove_bond(device);
+                self.lock_context().adapter_dbus.as_mut().unwrap().remove_bond(device);
             }
             "cancel" => {
                 let device = BluetoothDevice {
@@ -686,7 +793,7 @@ impl CommandHandler {
                     name: String::from("Classic Device"),
                 };
 
-                self.lock_context().adapter_dbus.as_ref().unwrap().cancel_bond_process(device);
+                self.lock_context().adapter_dbus.as_mut().unwrap().cancel_bond_process(device);
             }
             other => {
                 println!("Invalid argument '{}'", other);
@@ -752,6 +859,7 @@ impl CommandHandler {
                     name,
                     alias,
                     device_type,
+                    addr_type,
                     class,
                     appearance,
                     bonded,
@@ -764,6 +872,7 @@ impl CommandHandler {
 
                     let name = adapter.get_remote_name(device.clone());
                     let device_type = adapter.get_remote_type(device.clone());
+                    let addr_type = adapter.get_remote_address_type(device.clone());
                     let alias = adapter.get_remote_alias(device.clone());
                     let class = adapter.get_remote_class(device.clone());
                     let appearance = adapter.get_remote_appearance(device.clone());
@@ -780,6 +889,7 @@ impl CommandHandler {
                         name,
                         alias,
                         device_type,
+                        addr_type,
                         class,
                         appearance,
                         bonded,
@@ -792,7 +902,8 @@ impl CommandHandler {
                 print_info!("Address: {}", &device.address);
                 print_info!("Name: {}", name);
                 print_info!("Alias: {}", alias);
-                print_info!("Type: {:?}", device_type);
+                print_info!("Device Type: {:?}", device_type);
+                print_info!("Address Type: {:?}", addr_type);
                 print_info!("Class: {}", class);
                 print_info!("Appearance: {}", appearance);
                 print_info!("Wake Allowed: {}", wake_allowed);
@@ -889,6 +1000,27 @@ impl CommandHandler {
                     passkey,
                 );
             }
+            "get-rssi" => {
+                let device = BluetoothDevice {
+                    address: String::from(get_arg(args, 1)?),
+                    name: String::from(""),
+                };
+
+                match self
+                    .lock_context()
+                    .adapter_dbus
+                    .as_mut()
+                    .unwrap()
+                    .get_remote_rssi(device.clone())
+                {
+                    INVALID_RSSI => {
+                        println!("Invalid RSSI");
+                    }
+                    rssi => {
+                        println!("RSSI: {}", rssi);
+                    }
+                };
+            }
             other => {
                 println!("Invalid argument '{}'", other);
             }
@@ -908,6 +1040,8 @@ impl CommandHandler {
                 self.lock_context().manager_dbus.set_floss_enabled(false);
             }
             "show" => {
+                let (major, minor) = self.lock_context().get_floss_api_version();
+                print_info!("Floss API version: {}.{}", major, minor);
                 print_info!(
                     "Floss enabled: {}",
                     self.lock_context().manager_dbus.get_floss_enabled()
@@ -1192,6 +1326,98 @@ impl CommandHandler {
                     false,
                 );
             }
+            "unregister-server" => {
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed parsing server id"))?;
+
+                self.lock_context().gatt_dbus.as_mut().unwrap().unregister_server(server_id);
+            }
+            "server-connect" => {
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse server_id"))?;
+                let client_addr = String::from(get_arg(args, 2)?);
+                let is_direct = self.lock_context().gatt_server_context.is_connect_direct;
+                let transport = self.lock_context().gatt_server_context.connect_transport;
+
+                if !self.lock_context().gatt_dbus.as_mut().unwrap().server_connect(
+                    server_id,
+                    client_addr.clone(),
+                    is_direct,
+                    transport,
+                ) {
+                    return Err("Connection was unsuccessful".into());
+                }
+            }
+            "server-disconnect" => {
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse server_id"))?;
+                let client_addr = String::from(get_arg(args, 2)?);
+
+                if !self
+                    .lock_context()
+                    .gatt_dbus
+                    .as_mut()
+                    .unwrap()
+                    .server_disconnect(server_id, client_addr.clone())
+                {
+                    return Err("Disconnection was unsuccessful".into());
+                }
+            }
+            "server-add-heartrate-service" => {
+                let uuid = Uuid::from(UuidHelper::from_string(HEART_RATE_SERVICE_UUID).unwrap());
+
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse server_id"))?;
+                let service = BluetoothGattService::new(
+                    uuid.into(),
+                    0, // libbluetooth assigns this handle once the service is added
+                    GattDbElementType::PrimaryService.into(),
+                );
+
+                self.lock_context().gatt_dbus.as_mut().unwrap().add_service(server_id, service);
+            }
+            "server-remove-service" => {
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse server_id"))?;
+                let service_handle = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse service handle"))?;
+
+                self.lock_context()
+                    .gatt_dbus
+                    .as_mut()
+                    .unwrap()
+                    .remove_service(server_id, service_handle);
+            }
+            "server-clear-all-services" => {
+                let server_id = String::from(get_arg(args, 1)?)
+                    .parse::<i32>()
+                    .or(Err("Failed to parse server_id"))?;
+                self.lock_context().gatt_dbus.as_mut().unwrap().clear_services(server_id);
+            }
+            "server-set-direct-connect" => {
+                let is_direct = String::from(get_arg(args, 1)?)
+                    .parse::<bool>()
+                    .or(Err("Failed to parse is_direct"))?;
+
+                self.lock_context().gatt_server_context.is_connect_direct = is_direct;
+            }
+            "server-set-connect-transport" => {
+                let transport = match &get_arg(args, 1)?[..] {
+                    "Bredr" => BtTransport::Bredr,
+                    "LE" => BtTransport::Le,
+                    "Auto" => BtTransport::Auto,
+                    _ => {
+                        return Err("Failed to parse transport".into());
+                    }
+                };
+                self.lock_context().gatt_server_context.connect_transport = transport;
+            }
             _ => return Err(CommandError::InvalidArgs),
         }
         Ok(())
@@ -1236,7 +1462,7 @@ impl CommandHandler {
                     scanner_id,
                     // TODO(b/254870159): Construct real settings and filters depending on
                     // command line options.
-                    ScanSettings { interval: 0, window: 0, scan_type: ScanType::Active },
+                    None,
                     Some(btstack::bluetooth_gatt::ScanFilter {
                         rssi_high_threshold: 0,
                         rssi_low_threshold: 0,
@@ -1536,7 +1762,7 @@ impl CommandHandler {
                 let (addr, sock_type, psm_or_uuid) =
                     (&get_arg(args, 1)?, &get_arg(args, 2)?, &get_arg(args, 3)?);
                 let device = BluetoothDevice {
-                    address: addr.clone().into(),
+                    address: String::from(*addr),
                     name: String::from("Socket Connect Device"),
                 };
 
@@ -1558,7 +1784,7 @@ impl CommandHandler {
 
                     match &sock_type[0..] {
                         "l2cap" => {
-                            let psm = match psm_or_uuid.clone().parse::<i32>() {
+                            let psm = match psm_or_uuid.parse::<i32>() {
                                 Ok(v) => v,
                                 Err(e) => {
                                     return Err(CommandError::Failed(format!(
@@ -1583,7 +1809,7 @@ impl CommandHandler {
                             }
                         }
                         "rfcomm" => {
-                            let uuid = match UuidHelper::parse_string(psm_or_uuid.clone()) {
+                            let uuid = match UuidHelper::parse_string(*psm_or_uuid) {
                                 Some(uu) => uu,
                                 None => {
                                     return Err(CommandError::Failed(format!(
@@ -1623,6 +1849,26 @@ impl CommandHandler {
                     status, id, addr, sock_type, psm_or_uuid);
                 }
             }
+            "close" => {
+                let sockid = String::from(get_arg(args, 1)?)
+                    .parse::<u64>()
+                    .or(Err("Failed parsing socket ID"))?;
+                let status = self
+                    .context
+                    .lock()
+                    .unwrap()
+                    .socket_manager_dbus
+                    .as_mut()
+                    .unwrap()
+                    .close(callback_id, sockid);
+                if status != BtStatus::Success {
+                    return Err(format!(
+                        "Failed to close the listening socket, status = {:?}",
+                        status,
+                    )
+                    .into());
+                }
+            }
 
             _ => return Err(CommandError::InvalidArgs),
         };
@@ -1652,7 +1898,7 @@ impl CommandHandler {
                     .parse::<u8>()
                     .or(Err("Failed parsing report_id"))?;
 
-                self.context.lock().unwrap().qa_legacy_dbus.as_mut().unwrap().get_hid_report(
+                self.context.lock().unwrap().qa_dbus.as_mut().unwrap().get_hid_report(
                     addr,
                     report_type,
                     report_id,
@@ -1670,7 +1916,7 @@ impl CommandHandler {
                 };
                 let report_value = String::from(get_arg(args, 3)?);
 
-                self.context.lock().unwrap().qa_legacy_dbus.as_mut().unwrap().set_hid_report(
+                self.context.lock().unwrap().qa_dbus.as_mut().unwrap().set_hid_report(
                     addr,
                     report_type,
                     report_value,
@@ -1680,13 +1926,7 @@ impl CommandHandler {
                 let addr = String::from(get_arg(args, 1)?);
                 let data = String::from(get_arg(args, 2)?);
 
-                self.context
-                    .lock()
-                    .unwrap()
-                    .qa_legacy_dbus
-                    .as_mut()
-                    .unwrap()
-                    .send_hid_data(addr, data);
+                self.context.lock().unwrap().qa_dbus.as_mut().unwrap().send_hid_data(addr, data);
             }
             _ => return Err(CommandError::InvalidArgs),
         };
@@ -1803,7 +2043,7 @@ impl CommandHandler {
             }
             "enable" => {
                 let mut context = self.lock_context();
-                context.telephony_dbus.as_mut().unwrap().set_phone_ops_enabled(true);
+                context.telephony_dbus.as_mut().unwrap().set_mps_qualification_enabled(true);
                 if context.mps_sdp_handle.is_none() {
                     let success = context
                         .adapter_dbus
@@ -1817,7 +2057,7 @@ impl CommandHandler {
             }
             "disable" => {
                 let mut context = self.lock_context();
-                context.telephony_dbus.as_mut().unwrap().set_phone_ops_enabled(false);
+                context.telephony_dbus.as_mut().unwrap().set_mps_qualification_enabled(false);
                 if let Some(handle) = context.mps_sdp_handle.take() {
                     let success = context.adapter_dbus.as_mut().unwrap().remove_sdp_record(handle);
                     if !success {
@@ -1976,6 +2216,23 @@ impl CommandHandler {
             }
             _ => return Err(CommandError::InvalidArgs),
         };
+
+        Ok(())
+    }
+
+    fn cmd_media(&mut self, args: &Vec<String>) -> CommandResult {
+        if !self.context.lock().unwrap().adapter_ready {
+            return Err(self.adapter_not_ready());
+        }
+
+        match &get_arg(args, 0)?[..] {
+            "log" => {
+                self.context.lock().unwrap().media_dbus.as_mut().unwrap().trigger_debug_dump();
+            }
+            other => {
+                return Err(format!("Invalid argument '{}'", other).into());
+            }
+        }
 
         Ok(())
     }

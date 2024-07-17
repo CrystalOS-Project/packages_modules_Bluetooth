@@ -17,17 +17,21 @@
 
 #pragma once
 
+#include <bluetooth/log.h>
+
 #include <numeric>
 #include <optional>
 #include <set>
 #include <vector>
 
-#include "bta_gatt_api.h"
 #include "gap_api.h"
 #include "hardware/bt_has.h"
 #include "has_ctp.h"
 #include "has_journal.h"
 #include "has_preset.h"
+#include "internal_include/bt_trace.h"
+#include "stack/include/bt_types.h"
+#include "stack/include/gatt_api.h"
 
 namespace le_audio {
 namespace has {
@@ -313,7 +317,7 @@ class HasDevice : public GattServiceDevice {
     auto* const p_end = p_out + buffer_size;
     for (auto& preset : has_presets) {
       if (p_out + preset.SerializedSize() >= p_end) {
-        LOG(ERROR) << "Serialization error.";
+        bluetooth::log::error("Serialization error.");
         return false;
       }
       p_out = preset.Serialize(p_out, p_end - p_out);
@@ -329,7 +333,8 @@ class HasDevice : public GattServiceDevice {
                                  HasDevice& device) {
     HasPreset preset;
     if (len < 2 + preset.SerializedSize()) {
-      LOG(ERROR) << "Deserialization error. Invalid input buffer size length.";
+      bluetooth::log::error(
+          "Deserialization error. Invalid input buffer size length.");
       return false;
     }
     auto* p_end = p_in + len;
@@ -337,7 +342,7 @@ class HasDevice : public GattServiceDevice {
     uint8_t hdr;
     STREAM_TO_UINT8(hdr, p_in);
     if (hdr != kHasDeviceBinaryBlobHdr) {
-      LOG(ERROR) << __func__ << " Deserialization error. Bad header.";
+      bluetooth::log::error("Deserialization error. Bad header.");
       return false;
     }
 
@@ -348,7 +353,7 @@ class HasDevice : public GattServiceDevice {
     while (p_in < p_end) {
       auto* p_new = HasPreset::Deserialize(p_in, p_end - p_in, preset);
       if (p_new <= p_in) {
-        LOG(ERROR) << "Deserialization error. Invalid preset found.";
+        bluetooth::log::error("Deserialization error. Invalid preset found.");
         device.has_presets.clear();
         return false;
       }
@@ -418,3 +423,8 @@ class HasDevice : public GattServiceDevice {
 
 }  // namespace has
 }  // namespace le_audio
+
+namespace fmt {
+template <>
+struct formatter<le_audio::has::HasDevice> : ostream_formatter {};
+}  // namespace fmt
